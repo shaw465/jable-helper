@@ -4,29 +4,28 @@ Tampermonkey userscript for `jable.tv` and similar sites.
 
 ## 一键安装（电脑 / 手机）
 
-<a href="https://www.tampermonkey.net/script_installation.php#url=https%3A%2F%2Fraw.githubusercontent.com%2Fshaw465%2Fjable-helper%2Fmaster%2Fjable-helper.user.js">
-  <img alt="一键安装-电脑端" src="https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E5%AE%89%E8%A3%85-%E7%94%B5%E8%84%91%E7%AB%AF%20Tampermonkey-1677FF?style=for-the-badge&logo=tampermonkey&logoColor=white" />
-</a>
-<a href="https://www.tampermonkey.net/script_installation.php#url=https%3A%2F%2Fcdn.jsdelivr.net%2Fgh%2Fshaw465%2Fjable-helper%40master%2Fjable-helper.user.js">
-  <img alt="一键安装-手机端" src="https://img.shields.io/badge/%E4%B8%80%E9%94%AE%E5%AE%89%E8%A3%85-%E6%89%8B%E6%9C%BA%E7%AB%AF%20Tampermonkey-13A10E?style=for-the-badge&logo=android&logoColor=white" />
-</a>
+[![Install Script](https://img.shields.io/badge/Tampermonkey-一键安装脚本-2ea44f?style=for-the-badge)](https://raw.githubusercontent.com/shaw465/jable-helper/master/jable-helper.user.js)
+[![Install Script CDN](https://img.shields.io/badge/Tampermonkey-CDN备用安装-1677FF?style=for-the-badge)](https://cdn.jsdelivr.net/gh/shaw465/jable-helper@master/jable-helper.user.js)
 
 - 电脑端：Chrome / Edge + Tampermonkey
 - 手机端：Kiwi / 狐猴 + Tampermonkey（推荐）
-- 安卓 Edge：扩展支持是灰度能力，若按钮无响应，请改用上方“手机端”按钮或手动导入
+- 安卓 Edge：扩展支持不稳定，若按钮无响应，请复制下方 URL 到地址栏直接打开
 - 手动导入 URL：`https://raw.githubusercontent.com/shaw465/jable-helper/master/jable-helper.user.js`
 
 ## Features
 
-- Force mute all video/audio playback on page load and runtime.
 - Show related works by **real series metadata** (from `r18.dev`) on video pages.
 - Mobile-friendly floating panel: safe-area spacing + collapse/expand support on small screens.
 - Filter out series items that do not exist on current site to avoid dead links.
 - Built-in anti-abuse strategy for existence checks: local cache + request budget + random pacing + exponential cooldown + cache-only fallback.
-- Prefer sorting related series items by cached heart count (likes), then fallback to release date.
+- Related series supports **最热(红心优先)** / **最新(发行日优先)** switch.
+- Series list includes **当前片**标记，并显示主演信息（可获取时）。
+- 点击系列条目直接在**当前页面覆盖跳转**（不再新开标签页）。
 - Series-level ranked cache to reuse ordering results across pages in the same series.
+- Mobile gestures on player: left swipe for volume, right swipe for brightness, double tap play/pause, pinch to fullscreen landscape.
+- Mobile panel bottom offset optimized to reduce overlap by site bottom bars.
 
-## Supported Sites (v0.9.0)
+## Supported Sites (v0.9.2)
 
 - `jable.tv` (including subdomains)
 - Jable-like domains: `avple.tv` / `hpjav.tv` / `5av.tv` (including subdomains)
@@ -37,3 +36,14 @@ Tampermonkey userscript for `jable.tv` and similar sites.
 ## Script File
 
 - `jable-helper.user.js`
+
+## GreasyFork 发布说明
+
+- 我可以帮你准备发布文案和脚本元信息，但 **GreasyFork 最终发布必须用你的账号手动提交**（登录/验证码/成人内容勾选）。
+- 发布时请勾选：`This script contains adult content`（成人内容）。
+
+## TODO（后续待办）
+
+- [ ] MissAV (`missav.ws`)：在 Tampermonkey 运行态加载最新脚本后，复测 `ABP-901` 等样例，确认“相关系列”不再长期 `0 条`。
+- [ ] MissAV (`missav.com`)：针对首页重定向场景增加降级提示，避免用户误判脚本失效。
+- [ ] 主流站点联调清单：固定 `jable.tv` / `missav.ws` 冒烟样例，发版前执行一次最小回归。

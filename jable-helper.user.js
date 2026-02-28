@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Jable Helper
 // @namespace    https://tampermonkey.net/
-// @version      0.9.0
-// @description  多站视频页增强：自动静音 + 按真实系列展示相关作品
+// @version      0.9.2
+// @description  多站视频页增强：系列筛选 + 红心排序 + 移动端看片手势优化
 // @author       you
 // @match        https://jable.tv/*
 // @match        https://*.jable.tv/*
@@ -28,8 +28,12 @@
   const PANEL_ID = 'jh-series-panel';
   const STYLE_ID = 'jh-series-style';
   const TOGGLE_ID = 'jh-series-toggle';
+  const SORT_MODE_STORAGE_KEY = 'jh-series-sort-mode-v1';
+  const SORT_MODE_HOT = 'hot';
+  const SORT_MODE_NEWEST = 'newest';
   const PANEL_COLLAPSED_CLASS = 'jh-collapsed';
   const PANEL_COLLAPSED_STORAGE_KEY = 'jh-series-panel-collapsed';
+  const GESTURE_STYLE_ID = 'jh-player-gesture-style';
   const VIDEO_EXISTENCE_CACHE_KEY = 'jh-video-existence-cache-v1';
   const VIDEO_LIKE_CACHE_KEY = 'jh-video-like-cache-v1';
   const SERIES_ITEMS_CACHE_KEY = 'jh-series-items-cache-v1';
@@ -55,10 +59,18 @@
   const VERIFY_FAIL_CACHE_ONLY_THRESHOLD = 5;
   const VERIFY_CACHE_ONLY_MS = 20 * 60 * 1000;
   const REQUEST_TIMEOUT_MS = 12000;
+  const GESTURE_MIN_MOVE_PX = 8;
+  const GESTURE_VERTICAL_RATIO = 1.2;
+  const GESTURE_DOUBLE_TAP_MS = 300;
+  const GESTURE_DOUBLE_TAP_MAX_DISTANCE_PX = 24;
+  const GESTURE_VOLUME_STEP_PX = 220;
+  const GESTURE_BRIGHTNESS_STEP_PX = 260;
+  const GESTURE_BRIGHTNESS_MIN = 0.3;
+  const GESTURE_BRIGHTNESS_MAX = 1;
+  const GESTURE_PINCH_SCALE_TRIGGER = 1.12;
   const R18_BASE = 'https://r18.dev';
   const JABLE_LIKE_HOST_RE = /(?:^|\.)(?:jable|avple|hpjav|5av)\.tv$/i;
   const MISSAV_LIKE_HOST_RE = /(?:^|\.)missav\.(?:com|ws)$/i;
-  let isPlayPatched = false;
   const videoExistenceCache = new Map(); // url -> { exists, expireAt, checkedAt }
   const videoLikeCache = new Map(); // url -> { likeCount, expireAt, checkedAt }
   const seriesItemsCache = new Map(); // seriesId -> { items, expireAt, checkedAt }
@@ -69,6 +81,8 @@
   let verifyBackoffLevel = 0;
   let verifyConsecutiveFailures = 0;
   let detailRequestsUsed = 0;
+  let fullscreenOrientationBound = false;
+  let gestureObserverInstalled = false;
 
   function nowMs() {
     return Date.now();
@@ -84,6 +98,14 @@
       return min;
     }
     return Math.min(max, Math.max(min, Math.trunc(number)));
+  }
+
+  function clampNumber(value, min, max) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) {
+      return min;
+    }
+    return Math.min(max, Math.max(min, number));
   }
 
   function randomBetween(min, max) {
@@ -188,36 +210,39 @@
       .map((segment) => segment.trim())
       .filter(Boolean);
     if (segments.length === 0) {
-      return { slug: '', prefix: '/' };
+      return { slug: '', prefix: '/', locale: '', dm: '' };
     }
 
     let index = 0;
-    const prefixSegments = [];
+    let dm = '';
     if (/^dm\d+$/i.test(segments[index])) {
-      prefixSegments.push(segments[index]);
+      dm = segments[index].toLowerCase();
       index += 1;
     }
+
+    let locale = '';
     if (index < segments.length && /^[a-z]{2}$/i.test(segments[index])) {
-      prefixSegments.push(segments[index]);
+      locale = segments[index].toLowerCase();
       index += 1;
     }
+
+    const normalizedPrefix = locale ? `/${locale}/` : '/';
     if (index !== segments.length - 1) {
-      return { slug: '', prefix: '/' };
+      return { slug: '', prefix: normalizedPrefix, locale, dm };
     }
 
     const slug = segments[index].toLowerCase();
     if (!canonicalizeCode(slug)) {
-      return { slug: '', prefix: '/' };
+      return { slug: '', prefix: normalizedPrefix, locale, dm };
     }
 
-    const prefix = prefixSegments.length > 0 ? `/${prefixSegments.join('/')}/` : '/';
-    return { slug, prefix };
+    return { slug, prefix: normalizedPrefix, locale, dm };
   }
 
   function getMissavLikeDefaultPrefix() {
     const parts = extractMissavLikeParts(location.pathname);
-    if (parts.slug && parts.prefix) {
-      return parts.prefix;
+    if (parts.locale) {
+      return `/${parts.locale}/`;
     }
     const locale = document.documentElement?.lang;
     if (locale && /^[a-z]{2}$/i.test(locale)) {
@@ -282,6 +307,97 @@
       return '';
     }
     return new Intl.NumberFormat('en-US').format(value);
+  }
+
+  function normalizePerformerName(rawName) {
+    if (!rawName) {
+      return '';
+    }
+    const cleaned = String(rawName).replace(/\s+/g, ' ').trim();
+    if (!cleaned || cleaned.length > 36) {
+      return '';
+    }
+    if (/^(?:n\/a|unknown|null|undefined|匿名|不明)$/i.test(cleaned)) {
+      return '';
+    }
+    return cleaned;
+  }
+
+  function collectPerformerNames(source, bucket) {
+    if (!source) {
+      return;
+    }
+
+    if (Array.isArray(source)) {
+      source.forEach((item) => collectPerformerNames(item, bucket));
+      return;
+    }
+
+    if (typeof source === 'string') {
+      source
+        .split(/[、,\/|]|&| and /gi)
+        .map((segment) => normalizePerformerName(segment))
+        .filter(Boolean)
+        .forEach((name) => bucket.add(name));
+      return;
+    }
+
+    if (typeof source === 'object') {
+      const fields = [
+        source.name,
+        source.name_ja,
+        source.name_en,
+        source.display_name,
+        source.actress_name,
+        source.text
+      ];
+      fields.forEach((value) => collectPerformerNames(value, bucket));
+    }
+  }
+
+  function extractPerformersFromApiRow(row) {
+    if (!row || typeof row !== 'object') {
+      return [];
+    }
+    const bucket = new Set();
+    const fields = [
+      row.actress,
+      row.actresses,
+      row.actress_name,
+      row.actress_names,
+      row.actress_name_ja,
+      row.actress_name_en,
+      row.models,
+      row.performers,
+      row.stars
+    ];
+    fields.forEach((value) => collectPerformerNames(value, bucket));
+    return Array.from(bucket).slice(0, 3);
+  }
+
+  function extractPerformersFromPageDocument(doc = document) {
+    if (!doc) {
+      return [];
+    }
+    const bucket = new Set();
+    const selectors = [
+      '.video-info .models a',
+      '.video-info a[href*="/models/"]',
+      '.video-info a[href*="/star/"]',
+      '.video-info a[href*="/actress/"]',
+      '[class*="model"] a',
+      '[class*="actor"] a',
+      '[class*="performer"] a'
+    ];
+    selectors.forEach((selector) => {
+      doc.querySelectorAll(selector).forEach((node) => {
+        const name = normalizePerformerName(node.textContent || '');
+        if (name) {
+          bucket.add(name);
+        }
+      });
+    });
+    return Array.from(bucket).slice(0, 3);
   }
 
   function loadVideoExistenceCache() {
@@ -485,12 +601,18 @@
     const releaseDate = typeof item.releaseDate === 'string' ? item.releaseDate : '';
     const likeValue = Number(item.likeCount);
     const likeCount = Number.isFinite(likeValue) && likeValue >= 0 ? likeValue : null;
+    const performers = Array.isArray(item.performers)
+      ? item.performers.map((name) => normalizePerformerName(name)).filter(Boolean).slice(0, 3)
+      : [];
+    const isCurrent = item.isCurrent === true;
     return {
       code,
       title,
       url,
       releaseDate,
-      likeCount
+      likeCount,
+      performers,
+      isCurrent
     };
   }
 
@@ -587,7 +709,56 @@
       }
       return nextItem;
     });
-    return sortSeriesItemsByLikeCount(hydratedItems);
+    return hydratedItems;
+  }
+
+  function buildMissavVerifyUrlCandidates(canonicalUrl) {
+    try {
+      const url = new URL(canonicalUrl, location.origin);
+      if (!isMissavLikeHost(url.hostname)) {
+        return [url.toString()];
+      }
+
+      const target = extractMissavLikeParts(url.pathname);
+      if (!target.slug) {
+        return [url.toString()];
+      }
+
+      const current = extractMissavLikeParts(location.pathname);
+      const locale = target.locale || current.locale || '';
+      const currentDm = current.dm || '';
+      const dmFallbacks = ['dm18', 'dm21'];
+      const candidates = [];
+      const seen = new Set();
+
+      const pushPath = (path) => {
+        try {
+          const resolved = new URL(path, url.origin).toString();
+          if (seen.has(resolved)) {
+            return;
+          }
+          seen.add(resolved);
+          candidates.push(resolved);
+        } catch {}
+      };
+
+      const localeSegment = locale ? `${locale}/` : '';
+      if (currentDm) {
+        pushPath(`/${currentDm}/${localeSegment}${target.slug}/`);
+      }
+      if (locale) {
+        pushPath(`/${locale}/${target.slug}/`);
+      }
+      pushPath(`/${target.slug}/`);
+      dmFallbacks.forEach((dm) => {
+        pushPath(`/${dm}/${localeSegment}${target.slug}/`);
+      });
+      pushPath(url.pathname);
+
+      return candidates.length > 0 ? candidates : [url.toString()];
+    } catch {
+      return [canonicalUrl];
+    }
   }
 
   function setSeriesItemsCache(seriesId, items) {
@@ -633,6 +804,43 @@
     return window.matchMedia('(max-width: 960px)').matches;
   }
 
+  function normalizeSortMode(mode) {
+    return mode === SORT_MODE_NEWEST ? SORT_MODE_NEWEST : SORT_MODE_HOT;
+  }
+
+  function readSortModePreference() {
+    try {
+      return normalizeSortMode(localStorage.getItem(SORT_MODE_STORAGE_KEY));
+    } catch {
+      return SORT_MODE_HOT;
+    }
+  }
+
+  function writeSortModePreference(mode) {
+    const normalizedMode = normalizeSortMode(mode);
+    try {
+      localStorage.setItem(SORT_MODE_STORAGE_KEY, normalizedMode);
+    } catch {}
+    return normalizedMode;
+  }
+
+  function getPanelSortMode(panel) {
+    return normalizeSortMode(panel?.dataset?.sortMode || readSortModePreference());
+  }
+
+  function applySortModeState(panel, mode) {
+    if (!panel) {
+      return;
+    }
+    const normalizedMode = normalizeSortMode(mode);
+    panel.dataset.sortMode = normalizedMode;
+    panel.querySelectorAll('.jh-sort-btn').forEach((button) => {
+      const isActive = button.dataset.sortMode === normalizedMode;
+      button.classList.toggle('is-active', isActive);
+      button.setAttribute('aria-pressed', String(isActive));
+    });
+  }
+
   function readCollapsedPreference() {
     try {
       return localStorage.getItem(PANEL_COLLAPSED_STORAGE_KEY) === '1';
@@ -656,79 +864,394 @@
     }
   }
 
-  function muteMedia(media) {
-    if (!(media instanceof HTMLMediaElement)) {
+  function hasTouchCapability() {
+    return Boolean('ontouchstart' in window || navigator.maxTouchPoints > 0);
+  }
+
+  function ensureGestureStyle() {
+    if (document.getElementById(GESTURE_STYLE_ID)) {
       return;
     }
-    if (!media.muted) {
-      media.muted = true;
+    const style = document.createElement('style');
+    style.id = GESTURE_STYLE_ID;
+    style.textContent = `
+      .jh-gesture-layer {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        z-index: 3;
+      }
+      .jh-gesture-dim {
+        position: absolute;
+        inset: 0;
+        background: #000;
+        opacity: 0;
+        transition: opacity 0.12s linear;
+      }
+      .jh-gesture-hint {
+        position: absolute;
+        top: 12%;
+        left: 50%;
+        transform: translateX(-50%);
+        max-width: 75%;
+        padding: 4px 10px;
+        border-radius: 999px;
+        background: rgba(15, 23, 42, 0.8);
+        color: #f8fafc;
+        font-size: 12px;
+        font-weight: 600;
+        line-height: 1.3;
+        opacity: 0;
+        transition: opacity 0.16s ease;
+        text-align: center;
+      }
+      .jh-gesture-hint.is-visible {
+        opacity: 1;
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function getGestureContainer(video) {
+    if (!(video instanceof HTMLVideoElement)) {
+      return null;
     }
-    if (media.volume !== 0) {
-      media.volume = 0;
+    return (
+      video.closest('.plyr__video-wrapper') ||
+      video.closest('.plyr') ||
+      video.closest('[class*="player"]') ||
+      video.parentElement ||
+      video
+    );
+  }
+
+  function ensureGestureLayer(container) {
+    if (!(container instanceof Element)) {
+      return null;
     }
-    media.defaultMuted = true;
-    if (!media.hasAttribute('muted')) {
-      media.setAttribute('muted', '');
+    const existingLayer = container.querySelector(':scope > .jh-gesture-layer');
+    if (existingLayer) {
+      const dimNode = existingLayer.querySelector('.jh-gesture-dim');
+      const hintNode = existingLayer.querySelector('.jh-gesture-hint');
+      if (dimNode && hintNode) {
+        return { layer: existingLayer, dimNode, hintNode };
+      }
+    }
+
+    const computed = window.getComputedStyle(container);
+    if (computed.position === 'static') {
+      container.style.position = 'relative';
+    }
+
+    const layer = document.createElement('div');
+    layer.className = 'jh-gesture-layer';
+
+    const dimNode = document.createElement('div');
+    dimNode.className = 'jh-gesture-dim';
+
+    const hintNode = document.createElement('div');
+    hintNode.className = 'jh-gesture-hint';
+
+    layer.appendChild(dimNode);
+    layer.appendChild(hintNode);
+    container.appendChild(layer);
+    return { layer, dimNode, hintNode };
+  }
+
+  function calcTouchDistance(touchA, touchB) {
+    if (!touchA || !touchB) {
+      return 0;
+    }
+    const dx = touchA.clientX - touchB.clientX;
+    const dy = touchA.clientY - touchB.clientY;
+    return Math.hypot(dx, dy);
+  }
+
+  function isTouchOnControl(target) {
+    return target instanceof Element && Boolean(target.closest('.plyr__controls, button, a, input, select, textarea'));
+  }
+
+  function formatPercent(value) {
+    return `${Math.round(clampNumber(value, 0, 1) * 100)}%`;
+  }
+
+  function lockLandscapeOrientation() {
+    try {
+      if (screen.orientation && typeof screen.orientation.lock === 'function') {
+        screen.orientation.lock('landscape').catch(() => {});
+      }
+    } catch {}
+  }
+
+  function unlockOrientation() {
+    try {
+      if (screen.orientation && typeof screen.orientation.unlock === 'function') {
+        screen.orientation.unlock();
+      }
+    } catch {}
+  }
+
+  function bindFullscreenOrientationLifecycle() {
+    if (fullscreenOrientationBound) {
+      return;
+    }
+    fullscreenOrientationBound = true;
+
+    const onFullscreenChange = () => {
+      const activeFullscreenElement =
+        document.fullscreenElement ||
+        document.webkitFullscreenElement ||
+        document.mozFullScreenElement ||
+        document.msFullscreenElement;
+      if (activeFullscreenElement) {
+        lockLandscapeOrientation();
+      } else {
+        unlockOrientation();
+      }
+    };
+
+    ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange'].forEach((eventName) => {
+      document.addEventListener(eventName, onFullscreenChange, true);
+    });
+  }
+
+  async function requestFullscreen(element) {
+    if (!(element instanceof Element)) {
+      return false;
+    }
+    const request =
+      element.requestFullscreen ||
+      element.webkitRequestFullscreen ||
+      element.mozRequestFullScreen ||
+      element.msRequestFullscreen;
+    if (typeof request !== 'function') {
+      return false;
+    }
+    try {
+      const result = request.call(element);
+      if (result && typeof result.then === 'function') {
+        await result.catch(() => {});
+      }
+      return true;
+    } catch {
+      return false;
     }
   }
 
-  function installMuteGuard() {
-    if (!isPlayPatched) {
-      const originalPlay = HTMLMediaElement.prototype.play;
-      HTMLMediaElement.prototype.play = function (...args) {
-        muteMedia(this);
-        return originalPlay.apply(this, args);
-      };
-      isPlayPatched = true;
+  function installVideoGestureHandlers(video) {
+    if (!(video instanceof HTMLVideoElement) || video.dataset.jhGestureBound === '1') {
+      return;
+    }
+    const container = getGestureContainer(video);
+    if (!(container instanceof Element)) {
+      return;
+    }
+    const layerContext = ensureGestureLayer(container);
+    if (!layerContext) {
+      return;
     }
 
-    document.addEventListener(
-      'play',
-      (event) => {
-        muteMedia(event.target);
-      },
-      true
-    );
+    video.dataset.jhGestureBound = '1';
+    bindFullscreenOrientationLifecycle();
 
-    document.addEventListener(
-      'volumechange',
-      (event) => {
-        const target = event.target;
-        if (target instanceof HTMLMediaElement && (!target.muted || target.volume !== 0)) {
-          muteMedia(target);
-        }
-      },
-      true
-    );
-
-    const muteAll = () => {
-      document.querySelectorAll('video, audio').forEach(muteMedia);
+    const state = {
+      brightness: 1,
+      activeSide: '',
+      startX: 0,
+      startY: 0,
+      startVolume: 0,
+      startBrightness: 1,
+      moved: false,
+      pinchStartDistance: 0,
+      pinchTriggered: false,
+      hintTimer: 0,
+      lastTapAt: 0,
+      lastTapX: 0,
+      lastTapY: 0
     };
 
-    const observer = new MutationObserver((mutations) => {
-      for (const mutation of mutations) {
-        for (const node of mutation.addedNodes) {
-          if (!(node instanceof Element)) {
-            continue;
-          }
-          if (node.matches('video, audio')) {
-            muteMedia(node);
-          }
-          node.querySelectorAll?.('video, audio').forEach(muteMedia);
+    const showHint = (text) => {
+      if (!text) {
+        return;
+      }
+      layerContext.hintNode.textContent = text;
+      layerContext.hintNode.classList.add('is-visible');
+      if (state.hintTimer) {
+        clearTimeout(state.hintTimer);
+      }
+      state.hintTimer = window.setTimeout(() => {
+        layerContext.hintNode.classList.remove('is-visible');
+      }, 900);
+    };
+
+    const updateBrightness = (nextBrightness) => {
+      state.brightness = clampNumber(nextBrightness, GESTURE_BRIGHTNESS_MIN, GESTURE_BRIGHTNESS_MAX);
+      layerContext.dimNode.style.opacity = String(clampNumber(1 - state.brightness, 0, 0.7));
+      showHint(`亮度 ${formatPercent(state.brightness)}`);
+    };
+
+    const updateVolume = (nextVolume) => {
+      const volume = clampNumber(nextVolume, 0, 1);
+      video.volume = volume;
+      video.muted = volume <= 0.001;
+      showHint(`音量 ${formatPercent(volume)}`);
+    };
+
+    const togglePlayback = () => {
+      if (video.paused || video.ended) {
+        const playPromise = video.play();
+        if (playPromise && typeof playPromise.catch === 'function') {
+          playPromise.catch(() => {});
+        }
+        showHint('播放');
+      } else {
+        video.pause();
+        showHint('暂停');
+      }
+    };
+
+    const onTouchStart = (event) => {
+      if (isTouchOnControl(event.target)) {
+        return;
+      }
+
+      if (event.touches.length === 2) {
+        state.pinchStartDistance = calcTouchDistance(event.touches[0], event.touches[1]);
+        state.pinchTriggered = false;
+        state.moved = false;
+        return;
+      }
+
+      if (event.touches.length !== 1) {
+        return;
+      }
+
+      const touch = event.touches[0];
+      const rect = video.getBoundingClientRect();
+      if (touch.clientX < rect.left || touch.clientX > rect.right || touch.clientY < rect.top || touch.clientY > rect.bottom) {
+        return;
+      }
+
+      state.startX = touch.clientX;
+      state.startY = touch.clientY;
+      state.activeSide = touch.clientX <= rect.left + rect.width / 2 ? 'left' : 'right';
+      state.startVolume = clampNumber(video.muted ? 0 : video.volume, 0, 1);
+      state.startBrightness = state.brightness;
+      state.moved = false;
+      state.pinchStartDistance = 0;
+      state.pinchTriggered = false;
+    };
+
+    const onTouchMove = (event) => {
+      if (event.touches.length === 2 && state.pinchStartDistance > 0) {
+        const distance = calcTouchDistance(event.touches[0], event.touches[1]);
+        const scale = state.pinchStartDistance > 0 ? distance / state.pinchStartDistance : 1;
+        if (!state.pinchTriggered && scale >= GESTURE_PINCH_SCALE_TRIGGER) {
+          state.pinchTriggered = true;
+          requestFullscreen(container).then((entered) => {
+            if (entered) {
+              lockLandscapeOrientation();
+              showHint('已全屏横屏');
+            }
+          });
+        }
+        if (scale > 1.02) {
+          event.preventDefault();
+        }
+        return;
+      }
+
+      if (event.touches.length !== 1 || !state.activeSide) {
+        return;
+      }
+      const touch = event.touches[0];
+      const dx = touch.clientX - state.startX;
+      const dy = touch.clientY - state.startY;
+      const absDx = Math.abs(dx);
+      const absDy = Math.abs(dy);
+
+      if (!state.moved) {
+        if (absDy < GESTURE_MIN_MOVE_PX) {
+          return;
+        }
+        if (absDy <= absDx * GESTURE_VERTICAL_RATIO) {
+          return;
         }
       }
-    });
 
-    observer.observe(document.documentElement, {
-      childList: true,
-      subtree: true
-    });
+      state.moved = true;
+      event.preventDefault();
 
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', muteAll, { once: true });
-    } else {
-      muteAll();
+      if (state.activeSide === 'left') {
+        const nextVolume = state.startVolume - dy / GESTURE_VOLUME_STEP_PX;
+        updateVolume(nextVolume);
+      } else if (state.activeSide === 'right') {
+        const nextBrightness = state.startBrightness - dy / GESTURE_BRIGHTNESS_STEP_PX;
+        updateBrightness(nextBrightness);
+      }
+    };
+
+    const onTouchEnd = () => {
+      if (!state.activeSide && !state.moved) {
+        return;
+      }
+
+      if (!state.moved && state.activeSide) {
+        const currentTime = nowMs();
+        const deltaTime = currentTime - state.lastTapAt;
+        const tapDistance = Math.hypot(state.startX - state.lastTapX, state.startY - state.lastTapY);
+        if (state.lastTapAt > 0 && deltaTime <= GESTURE_DOUBLE_TAP_MS && tapDistance <= GESTURE_DOUBLE_TAP_MAX_DISTANCE_PX) {
+          togglePlayback();
+          state.lastTapAt = 0;
+        } else {
+          state.lastTapAt = currentTime;
+          state.lastTapX = state.startX;
+          state.lastTapY = state.startY;
+        }
+      }
+
+      state.activeSide = '';
+      state.moved = false;
+      state.pinchStartDistance = 0;
+      state.pinchTriggered = false;
+    };
+
+    container.addEventListener('touchstart', onTouchStart, { passive: true });
+    container.addEventListener('touchmove', onTouchMove, { passive: false });
+    container.addEventListener('touchend', onTouchEnd, { passive: true });
+    container.addEventListener('touchcancel', onTouchEnd, { passive: true });
+  }
+
+  function installMobileVideoGestures() {
+    if (gestureObserverInstalled || !hasTouchCapability() || !isVideoPage()) {
+      return;
     }
+    gestureObserverInstalled = true;
+    ensureGestureStyle();
+
+    const bindExistingVideos = (root = document) => {
+      root.querySelectorAll?.('video').forEach(installVideoGestureHandlers);
+      if (root instanceof HTMLVideoElement) {
+        installVideoGestureHandlers(root);
+      }
+    };
+
+    bindExistingVideos(document);
+
+    const observer = new MutationObserver((mutations) => {
+      mutations.forEach((mutation) => {
+        mutation.addedNodes.forEach((node) => {
+          if (!(node instanceof Element)) {
+            return;
+          }
+          bindExistingVideos(node);
+        });
+      });
+    });
+    observer.observe(document.documentElement, {
+      subtree: true,
+      childList: true
+    });
   }
 
   function isVideoPage() {
@@ -846,11 +1369,11 @@
     };
   }
 
-  async function loadSeriesItems(seriesId, currentCode) {
+  async function loadSeriesItems(seriesId) {
     const shouldUseStaleCache = isVerifyNetworkRestricted();
     const cachedItems = getSeriesItemsFromCache(seriesId, { allowStale: shouldUseStaleCache });
     if (cachedItems && cachedItems.length > 0) {
-      return cachedItems.filter((item) => item.code !== currentCode).slice(0, ITEM_LIMIT);
+      return cachedItems.slice(0, CANDIDATE_LIMIT);
     }
     if (shouldUseStaleCache) {
       return [];
@@ -881,7 +1404,8 @@
           code,
           title,
           url: buildVideoUrlForCurrentSite(code),
-          releaseDate: row?.release_date || ''
+          releaseDate: row?.release_date || '',
+          performers: extractPerformersFromApiRow(row)
         });
       });
 
@@ -889,9 +1413,9 @@
     }
 
     const candidates = Array.from(items.values()).slice(0, CANDIDATE_LIMIT);
-    const rankedItems = await filterItemsExistingOnJable(candidates);
-    setSeriesItemsCache(seriesId, rankedItems);
-    return rankedItems.filter((item) => item.code !== currentCode).slice(0, ITEM_LIMIT);
+    const verifiedItems = await filterItemsExistingOnJable(candidates);
+    setSeriesItemsCache(seriesId, verifiedItems);
+    return verifiedItems.slice(0, CANDIDATE_LIMIT);
   }
 
   function isVideoPath(pathname, hostname = location.hostname) {
@@ -945,12 +1469,19 @@
     }
   }
 
-  function sortSeriesItemsByLikeCount(items) {
+  function sortSeriesItems(items, mode = SORT_MODE_HOT) {
+    const normalizedMode = normalizeSortMode(mode);
     return items
       .slice()
       .sort((a, b) => {
         const aLike = Number.isFinite(a.likeCount) ? a.likeCount : null;
         const bLike = Number.isFinite(b.likeCount) ? b.likeCount : null;
+        const aDate = String(a.releaseDate || '');
+        const bDate = String(b.releaseDate || '');
+
+        if (normalizedMode === SORT_MODE_NEWEST && aDate !== bDate) {
+          return bDate.localeCompare(aDate);
+        }
         if (aLike !== null && bLike !== null && aLike !== bLike) {
           return bLike - aLike;
         }
@@ -960,7 +1491,10 @@
         if (aLike === null && bLike !== null) {
           return 1;
         }
-        return String(b.releaseDate || '').localeCompare(String(a.releaseDate || ''));
+        if (aDate !== bDate) {
+          return bDate.localeCompare(aDate);
+        }
+        return String(a.code || '').localeCompare(String(b.code || ''));
       });
   }
 
@@ -985,11 +1519,11 @@
       return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest: false };
     }
 
-    const requestWithTimeout = async (method) => {
+    const requestWithTimeout = async (targetUrl, method) => {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
       try {
-        return await fetch(canonicalUrl, {
+        return await fetch(targetUrl, {
           method,
           credentials: 'same-origin',
           redirect: 'follow',
@@ -1003,53 +1537,90 @@
 
     try {
       let usedDetailRequest = false;
-      let method = withLikeCount ? 'GET' : 'HEAD';
-      let response = await requestWithTimeout(method);
-      if (method === 'HEAD' && (response.status === 405 || response.status === 501)) {
-        method = 'GET';
-        usedDetailRequest = true;
-        response = await requestWithTimeout(method);
-      }
-      if (response.status === 429 || response.status === 403) {
-        markVerifyThrottled();
-        return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
+      const canonicalUrlObject = new URL(canonicalUrl, location.origin);
+      const isMissavTarget = isMissavLikeHost(canonicalUrlObject.hostname);
+      const requestUrls = isMissavTarget ? buildMissavVerifyUrlCandidates(canonicalUrl) : [canonicalUrl];
+      const baseMethod = withLikeCount ? 'GET' : 'HEAD';
+      let sawNotFound = false;
+      let sawForbidden = false;
+
+      for (const requestUrl of requestUrls) {
+        let method = baseMethod;
+        let response = await requestWithTimeout(requestUrl, method);
+        if (method === 'HEAD' && (response.status === 405 || response.status === 501)) {
+          method = 'GET';
+          usedDetailRequest = true;
+          response = await requestWithTimeout(requestUrl, method);
+        }
+
+        if (response.status === 429) {
+          markVerifyThrottled();
+          return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
+        }
+        if (response.status === 403) {
+          if (isMissavTarget) {
+            sawForbidden = true;
+            continue;
+          }
+          markVerifyThrottled();
+          return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
+        }
+        if (response.status === 404) {
+          if (isMissavTarget) {
+            sawNotFound = true;
+            continue;
+          }
+          setVideoExistenceCache(canonicalUrl, false);
+          markVerifySuccess();
+          return { exists: false, likeCount: null, usedDetailRequest };
+        }
+
+        const finalUrl = response.url || requestUrl;
+        const normalizedFinalUrl = normalizeVideoUrl(finalUrl);
+        const finalUrlObject = new URL(finalUrl, location.origin);
+        const finalPath = finalUrlObject.pathname;
+        const isVideoRoute = Boolean(normalizedFinalUrl) && isVideoPath(finalPath, finalUrlObject.hostname);
+        if (!isVideoRoute) {
+          if (isMissavTarget) {
+            continue;
+          }
+          markVerifyFailure();
+          return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
+        }
+
+        if (!response.ok) {
+          if (isMissavTarget) {
+            continue;
+          }
+          markVerifyFailure();
+          return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
+        }
+
+        setVideoExistenceCache(canonicalUrl, true);
+
+        let likeCount = cachedLike;
+        if (method === 'GET') {
+          usedDetailRequest = true;
+          const htmlText = await response.text();
+          const parsedLike = extractLikeCountFromHtml(htmlText);
+          if (parsedLike !== null) {
+            likeCount = parsedLike;
+            setLikeCountCache(canonicalUrl, parsedLike);
+          }
+        }
+
+        markVerifySuccess();
+        return { exists: true, likeCount, usedDetailRequest };
       }
 
-      const finalUrl = response.url || canonicalUrl;
-      const normalizedFinalUrl = normalizeVideoUrl(finalUrl);
-      const finalUrlObject = new URL(finalUrl, location.origin);
-      const finalPath = finalUrlObject.pathname;
-      const isVideoRoute = Boolean(normalizedFinalUrl) && isVideoPath(finalPath, finalUrlObject.hostname);
-      if (!isVideoRoute) {
-        markVerifyFailure();
-        return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
-      }
-
-      if (response.status === 404) {
+      if (isMissavTarget && sawNotFound && !sawForbidden) {
         setVideoExistenceCache(canonicalUrl, false);
         markVerifySuccess();
         return { exists: false, likeCount: null, usedDetailRequest };
       }
-      if (!response.ok) {
-        markVerifyFailure();
-        return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
-      }
 
-      setVideoExistenceCache(canonicalUrl, true);
-
-      let likeCount = cachedLike;
-      if (method === 'GET') {
-        usedDetailRequest = true;
-        const htmlText = await response.text();
-        const parsedLike = extractLikeCountFromHtml(htmlText);
-        if (parsedLike !== null) {
-          likeCount = parsedLike;
-          setLikeCountCache(canonicalUrl, parsedLike);
-        }
-      }
-
-      markVerifySuccess();
-      return { exists: true, likeCount, usedDetailRequest };
+      markVerifyFailure();
+      return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
     } catch {
       markVerifyFailure();
       return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest: false };
@@ -1064,7 +1635,7 @@
     const verified = [];
     detailRequestsUsed = 0;
     for (const item of items) {
-      if (verified.length >= ITEM_LIMIT) {
+      if (verified.length >= CANDIDATE_LIMIT) {
         break;
       }
 
@@ -1092,7 +1663,7 @@
       }
       verified.push(item);
     }
-    return sortSeriesItemsByLikeCount(verified);
+    return verified;
   }
 
   function harvestLikeCountsFromPage() {
@@ -1157,6 +1728,101 @@
     });
   }
 
+  function inferReleaseDateFromPage() {
+    const selectorCandidates = [
+      'meta[itemprop="datePublished"]',
+      'meta[property="video:release_date"]',
+      '.video-info .meta',
+      '.video-info',
+      'body'
+    ];
+    for (const selector of selectorCandidates) {
+      const node = document.querySelector(selector);
+      if (!node) {
+        continue;
+      }
+      const text = selector.startsWith('meta')
+        ? node.getAttribute('content') || ''
+        : node.textContent || '';
+      const matched = text.match(/\b(20\d{2}-\d{2}-\d{2})\b/);
+      if (matched) {
+        return matched[1];
+      }
+    }
+    return '';
+  }
+
+  function inferCurrentTitleFromPage() {
+    const titleSelectors = ['.video-info h4', '.mt-4 h1', 'h1', 'meta[property="og:title"]'];
+    for (const selector of titleSelectors) {
+      const node = document.querySelector(selector);
+      if (!node) {
+        continue;
+      }
+      const text = selector.startsWith('meta') ? node.getAttribute('content') || '' : node.textContent || '';
+      if (text.trim()) {
+        return text.trim();
+      }
+    }
+    return document.title || '';
+  }
+
+  function buildCurrentSeriesItem(currentCode) {
+    if (!currentCode) {
+      return null;
+    }
+    const currentUrl = normalizeVideoUrl(location.href) || buildVideoUrlForCurrentSite(currentCode);
+    if (!currentUrl) {
+      return null;
+    }
+    const currentLike = extractLikeCountFromDocument(document);
+    if (currentLike !== null) {
+      setLikeCountCache(currentUrl, currentLike);
+    }
+    setVideoExistenceCache(currentUrl, true);
+    return normalizeSeriesItem({
+      code: currentCode,
+      title: inferCurrentTitleFromPage(),
+      url: currentUrl,
+      releaseDate: inferReleaseDateFromPage(),
+      likeCount: currentLike,
+      performers: extractPerformersFromPageDocument(document)
+    });
+  }
+
+  function mergeCurrentItemIntoSeries(items, currentItem, currentCode) {
+    const sourceItems = Array.isArray(items) ? items : [];
+    const merged = sourceItems.map((item) => ({ ...item }));
+    const codeKey = String(currentCode || '').toUpperCase();
+    if (!codeKey) {
+      return merged;
+    }
+
+    let found = false;
+    for (const item of merged) {
+      if (String(item.code || '').toUpperCase() !== codeKey) {
+        continue;
+      }
+      found = true;
+      item.isCurrent = true;
+      if (currentItem) {
+        item.url = currentItem.url || item.url;
+        item.title = currentItem.title || item.title;
+        item.releaseDate = currentItem.releaseDate || item.releaseDate;
+        item.likeCount = Number.isFinite(currentItem.likeCount) ? currentItem.likeCount : item.likeCount;
+        item.performers = Array.isArray(currentItem.performers) && currentItem.performers.length > 0
+          ? currentItem.performers
+          : item.performers;
+      }
+      break;
+    }
+
+    if (!found && currentItem) {
+      merged.push({ ...currentItem, isCurrent: true });
+    }
+    return merged;
+  }
+
   function ensurePanelStyle() {
     if (document.getElementById(STYLE_ID)) {
       return;
@@ -1199,6 +1865,28 @@
         align-items: center;
         gap: 8px;
       }
+      #${PANEL_ID} .jh-sort {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 2px;
+        border-radius: 8px;
+        background: rgba(30, 41, 59, 0.48);
+      }
+      #${PANEL_ID} .jh-sort-btn {
+        border: none;
+        border-radius: 6px;
+        padding: 2px 8px;
+        font-size: 12px;
+        line-height: 1.4;
+        color: #cbd5e1;
+        background: transparent;
+      }
+      #${PANEL_ID} .jh-sort-btn.is-active {
+        color: #0f172a;
+        font-weight: 700;
+        background: #7dd3fc;
+      }
       #${PANEL_ID} .jh-toggle {
         display: none;
         border: 1px solid rgba(148, 163, 184, 0.45);
@@ -1214,6 +1902,7 @@
         overflow: auto;
         overscroll-behavior: contain;
         -webkit-overflow-scrolling: touch;
+        padding-bottom: 8px;
       }
       #${PANEL_ID}.${PANEL_COLLAPSED_CLASS} {
         max-height: 52px;
@@ -1242,6 +1931,18 @@
         color: #7dd3fc;
         font-weight: 700;
       }
+      #${PANEL_ID} .jh-badge {
+        display: inline-block;
+        margin-left: 6px;
+        padding: 1px 6px;
+        border-radius: 999px;
+        font-size: 11px;
+        line-height: 1.4;
+        color: #052e16;
+        background: #86efac;
+        font-weight: 700;
+        vertical-align: middle;
+      }
       #${PANEL_ID} .jh-title {
         color: #cbd5e1;
         display: block;
@@ -1261,7 +1962,7 @@
           top: auto;
           right: calc(12px + env(safe-area-inset-right));
           left: calc(12px + env(safe-area-inset-left));
-          bottom: calc(12px + env(safe-area-inset-bottom));
+          bottom: calc(58px + env(safe-area-inset-bottom));
           width: auto;
           max-height: 42vh;
         }
@@ -1270,8 +1971,12 @@
           align-items: center;
           justify-content: center;
         }
+        #${PANEL_ID} .jh-sort-btn {
+          padding: 2px 7px;
+        }
         #${PANEL_ID} .jh-body {
           max-height: calc(42vh - 46px);
+          padding-bottom: calc(14px + env(safe-area-inset-bottom));
         }
       }
     `;
@@ -1287,6 +1992,10 @@
         <div class="jh-header">
           <span id="jh-series-title">${title}</span>
           <div class="jh-actions">
+            <div class="jh-sort" role="group" aria-label="排序方式">
+              <button type="button" class="jh-sort-btn" data-sort-mode="${SORT_MODE_HOT}" aria-pressed="true">最热</button>
+              <button type="button" class="jh-sort-btn" data-sort-mode="${SORT_MODE_NEWEST}" aria-pressed="false">最新</button>
+            </div>
             <span class="jh-sub" id="jh-series-count">加载中...</span>
             <button type="button" class="jh-toggle" id="${TOGGLE_ID}" aria-expanded="true">收起</button>
           </div>
@@ -1306,8 +2015,25 @@
       });
     }
 
+    if (panel.dataset.sortBound !== '1') {
+      panel.dataset.sortBound = '1';
+      panel.addEventListener('click', (event) => {
+        const button = event.target instanceof Element ? event.target.closest('.jh-sort-btn') : null;
+        if (!button) {
+          return;
+        }
+        const nextMode = writeSortModePreference(button.dataset.sortMode);
+        applySortModeState(panel, nextMode);
+        const renderState = panel.__jhRenderState;
+        if (renderState) {
+          renderPanel(renderState.title, renderState.items, renderState.emptyMessage);
+        }
+      });
+    }
+
     const shouldCollapse = isMobileViewport() && readCollapsedPreference();
     applyCollapsedState(panel, shouldCollapse);
+    applySortModeState(panel, readSortModePreference());
 
     if (panel.dataset.responsiveBound !== '1') {
       panel.dataset.responsiveBound = '1';
@@ -1336,26 +2062,33 @@
     }
 
     titleNode.textContent = title;
+    panel.__jhRenderState = {
+      title,
+      items: Array.isArray(items) ? items.slice() : [],
+      emptyMessage
+    };
 
-    if (!items || items.length === 0) {
+    const normalizedItems = Array.isArray(items) ? items : [];
+    if (normalizedItems.length === 0) {
       countNode.textContent = '0 条';
       bodyNode.innerHTML = `<div class="jh-empty">${emptyMessage}</div>`;
       return;
     }
 
-    countNode.textContent = `${items.length} 条`;
+    const sortedItems = sortSeriesItems(normalizedItems, getPanelSortMode(panel));
+    const visibleItems = sortedItems.slice(0, ITEM_LIMIT);
+    countNode.textContent =
+      sortedItems.length > visibleItems.length ? `${visibleItems.length}/${sortedItems.length} 条` : `${visibleItems.length} 条`;
     bodyNode.innerHTML = '';
 
     const fragment = document.createDocumentFragment();
-    items.forEach((item) => {
+    visibleItems.forEach((item) => {
       const row = document.createElement('div');
       row.className = 'jh-item';
 
       const link = document.createElement('a');
       link.className = 'jh-link';
       link.href = item.url;
-      link.target = '_blank';
-      link.rel = 'noopener noreferrer';
 
       const code = document.createElement('span');
       code.className = 'jh-code';
@@ -1366,11 +2099,20 @@
       titleNode.textContent = item.title;
 
       link.appendChild(code);
+      if (item.isCurrent) {
+        const badge = document.createElement('span');
+        badge.className = 'jh-badge';
+        badge.textContent = '当前';
+        link.appendChild(badge);
+      }
       link.appendChild(titleNode);
 
       const metaParts = [];
       if (Number.isFinite(item.likeCount)) {
         metaParts.push(`红心：${formatNumber(item.likeCount)}`);
+      }
+      if (Array.isArray(item.performers) && item.performers.length > 0) {
+        metaParts.push(`主演：${item.performers.join(' / ')}`);
       }
       if (item.releaseDate) {
         metaParts.push(`发行：${item.releaseDate}`);
@@ -1394,6 +2136,7 @@
     if (!isVideoPage()) {
       return;
     }
+    installMobileVideoGestures();
 
     const currentSlug = getCurrentSlug();
     const currentCode = inferCodeFromPage(currentSlug);
@@ -1413,15 +2156,16 @@
       }
 
       const title = `相关系列作品（${seriesContext.seriesName}）`;
-      const items = await loadSeriesItems(seriesContext.seriesId, currentCode);
-      renderPanel(title, items, '系列存在，但未找到可展示条目');
+      const items = await loadSeriesItems(seriesContext.seriesId);
+      const currentItem = buildCurrentSeriesItem(currentCode);
+      const mergedItems = mergeCurrentItemIntoSeries(items, currentItem, currentCode);
+      renderPanel(title, mergedItems, '系列存在，但未找到可展示条目');
     } catch (error) {
       console.warn('[Jable Helper] 系列加载失败:', error);
       renderPanel('相关系列作品', [], '系列数据加载失败，请稍后重试');
     }
   }
 
-  installMuteGuard();
   loadVideoExistenceCache();
   loadVideoLikeCache();
   loadSeriesItemsCache();
