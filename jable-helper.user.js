@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Jable Helper
 // @namespace    https://tampermonkey.net/
-// @version      0.3.0
+// @version      0.4.0
 // @description  jable.tv 视频页增强：自动静音 + 按真实系列展示相关作品
 // @author       you
 // @match        https://jable.tv/*
@@ -15,10 +15,40 @@
 
   const PANEL_ID = 'jh-series-panel';
   const STYLE_ID = 'jh-series-style';
+  const TOGGLE_ID = 'jh-series-toggle';
+  const PANEL_COLLAPSED_CLASS = 'jh-collapsed';
+  const PANEL_COLLAPSED_STORAGE_KEY = 'jh-series-panel-collapsed';
   const ITEM_LIMIT = 24;
   const REQUEST_TIMEOUT_MS = 12000;
   const R18_BASE = 'https://r18.dev';
   let isPlayPatched = false;
+
+  function isMobileViewport() {
+    return window.matchMedia('(max-width: 960px)').matches;
+  }
+
+  function readCollapsedPreference() {
+    try {
+      return localStorage.getItem(PANEL_COLLAPSED_STORAGE_KEY) === '1';
+    } catch {
+      return false;
+    }
+  }
+
+  function writeCollapsedPreference(collapsed) {
+    try {
+      localStorage.setItem(PANEL_COLLAPSED_STORAGE_KEY, collapsed ? '1' : '0');
+    } catch {}
+  }
+
+  function applyCollapsedState(panel, collapsed) {
+    panel.classList.toggle(PANEL_COLLAPSED_CLASS, collapsed);
+    const toggle = panel.querySelector(`#${TOGGLE_ID}`);
+    if (toggle) {
+      toggle.textContent = collapsed ? '展开' : '收起';
+      toggle.setAttribute('aria-expanded', String(!collapsed));
+    }
+  }
 
   function muteMedia(media) {
     if (!(media instanceof HTMLMediaElement)) {
@@ -258,9 +288,32 @@
         font-weight: 500;
         font-size: 12px;
       }
+      #${PANEL_ID} .jh-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      #${PANEL_ID} .jh-toggle {
+        display: none;
+        border: 1px solid rgba(148, 163, 184, 0.45);
+        border-radius: 8px;
+        padding: 2px 8px;
+        font-size: 12px;
+        line-height: 1.4;
+        color: #e5e7eb;
+        background: rgba(30, 41, 59, 0.55);
+      }
       #${PANEL_ID} .jh-body {
         max-height: calc(76vh - 46px);
         overflow: auto;
+        overscroll-behavior: contain;
+        -webkit-overflow-scrolling: touch;
+      }
+      #${PANEL_ID}.${PANEL_COLLAPSED_CLASS} {
+        max-height: 52px;
+      }
+      #${PANEL_ID}.${PANEL_COLLAPSED_CLASS} .jh-body {
+        display: none;
       }
       #${PANEL_ID} .jh-item {
         border-bottom: 1px solid rgba(148, 163, 184, 0.12);
@@ -300,11 +353,16 @@
       @media (max-width: 960px) {
         #${PANEL_ID} {
           top: auto;
-          right: 12px;
-          left: 12px;
-          bottom: 12px;
+          right: calc(12px + env(safe-area-inset-right));
+          left: calc(12px + env(safe-area-inset-left));
+          bottom: calc(12px + env(safe-area-inset-bottom));
           width: auto;
           max-height: 42vh;
+        }
+        #${PANEL_ID} .jh-toggle {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
         }
         #${PANEL_ID} .jh-body {
           max-height: calc(42vh - 46px);
@@ -322,12 +380,43 @@
       panel.innerHTML = `
         <div class="jh-header">
           <span id="jh-series-title">${title}</span>
-          <span class="jh-sub" id="jh-series-count">加载中...</span>
+          <div class="jh-actions">
+            <span class="jh-sub" id="jh-series-count">加载中...</span>
+            <button type="button" class="jh-toggle" id="${TOGGLE_ID}" aria-expanded="true">收起</button>
+          </div>
         </div>
         <div class="jh-body" id="jh-series-body"></div>
       `;
       document.body.appendChild(panel);
     }
+
+    const toggle = panel.querySelector(`#${TOGGLE_ID}`);
+    if (toggle && toggle.dataset.bound !== '1') {
+      toggle.dataset.bound = '1';
+      toggle.addEventListener('click', () => {
+        const collapsed = !panel.classList.contains(PANEL_COLLAPSED_CLASS);
+        applyCollapsedState(panel, collapsed);
+        writeCollapsedPreference(collapsed);
+      });
+    }
+
+    const shouldCollapse = isMobileViewport() && readCollapsedPreference();
+    applyCollapsedState(panel, shouldCollapse);
+
+    if (panel.dataset.responsiveBound !== '1') {
+      panel.dataset.responsiveBound = '1';
+      const mediaQuery = window.matchMedia('(max-width: 960px)');
+      const syncPanelMode = () => {
+        const nextCollapsed = mediaQuery.matches ? readCollapsedPreference() : false;
+        applyCollapsedState(panel, nextCollapsed);
+      };
+      if (typeof mediaQuery.addEventListener === 'function') {
+        mediaQuery.addEventListener('change', syncPanelMode);
+      } else if (typeof mediaQuery.addListener === 'function') {
+        mediaQuery.addListener(syncPanelMode);
+      }
+    }
+
     return panel;
   }
 
