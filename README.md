@@ -19,10 +19,13 @@ Tampermonkey userscript for `jable.tv` and similar sites.
 - Filter out series items that do not exist on current site to avoid dead links.
 - Built-in anti-abuse strategy for existence checks: local cache + request budget + random pacing + exponential cooldown + cache-only fallback.
 - Related series supports **最热(红心优先)** / **最新(发行日优先)** switch.
+- Series list includes **当前片**标记，并显示主演信息（可获取时）。
+- 点击系列条目直接在**当前页面覆盖跳转**（不再新开标签页）。
 - Series-level ranked cache to reuse ordering results across pages in the same series.
 - Mobile gestures on player: left swipe for volume, right swipe for brightness, double tap play/pause, pinch to fullscreen landscape.
+- Mobile panel bottom offset optimized to reduce overlap by site bottom bars.
 
-## Supported Sites (v0.9.1)
+## Supported Sites (v0.9.2)
 
 - `jable.tv` (including subdomains)
 - Jable-like domains: `avple.tv` / `hpjav.tv` / `5av.tv` (including subdomains)
@@ -33,6 +36,11 @@ Tampermonkey userscript for `jable.tv` and similar sites.
 ## Script File
 
 - `jable-helper.user.js`
+
+## GreasyFork 发布说明
+
+- 我可以帮你准备发布文案和脚本元信息，但 **GreasyFork 最终发布必须用你的账号手动提交**（登录/验证码/成人内容勾选）。
+- 发布时请勾选：`This script contains adult content`（成人内容）。
 
 ## TODO（后续待办）
 

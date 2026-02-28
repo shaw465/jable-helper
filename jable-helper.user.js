@@ -604,13 +604,15 @@
     const performers = Array.isArray(item.performers)
       ? item.performers.map((name) => normalizePerformerName(name)).filter(Boolean).slice(0, 3)
       : [];
+    const isCurrent = item.isCurrent === true;
     return {
       code,
       title,
       url,
       releaseDate,
       likeCount,
-      performers
+      performers,
+      isCurrent
     };
   }
 
@@ -1367,11 +1369,11 @@
     };
   }
 
-  async function loadSeriesItems(seriesId, currentCode) {
+  async function loadSeriesItems(seriesId) {
     const shouldUseStaleCache = isVerifyNetworkRestricted();
     const cachedItems = getSeriesItemsFromCache(seriesId, { allowStale: shouldUseStaleCache });
     if (cachedItems && cachedItems.length > 0) {
-      return cachedItems.filter((item) => item.code !== currentCode).slice(0, CANDIDATE_LIMIT);
+      return cachedItems.slice(0, CANDIDATE_LIMIT);
     }
     if (shouldUseStaleCache) {
       return [];
@@ -1402,7 +1404,8 @@
           code,
           title,
           url: buildVideoUrlForCurrentSite(code),
-          releaseDate: row?.release_date || ''
+          releaseDate: row?.release_date || '',
+          performers: extractPerformersFromApiRow(row)
         });
       });
 
@@ -1412,7 +1415,7 @@
     const candidates = Array.from(items.values()).slice(0, CANDIDATE_LIMIT);
     const verifiedItems = await filterItemsExistingOnJable(candidates);
     setSeriesItemsCache(seriesId, verifiedItems);
-    return verifiedItems.filter((item) => item.code !== currentCode).slice(0, CANDIDATE_LIMIT);
+    return verifiedItems.slice(0, CANDIDATE_LIMIT);
   }
 
   function isVideoPath(pathname, hostname = location.hostname) {
@@ -1725,6 +1728,101 @@
     });
   }
 
+  function inferReleaseDateFromPage() {
+    const selectorCandidates = [
+      'meta[itemprop="datePublished"]',
+      'meta[property="video:release_date"]',
+      '.video-info .meta',
+      '.video-info',
+      'body'
+    ];
+    for (const selector of selectorCandidates) {
+      const node = document.querySelector(selector);
+      if (!node) {
+        continue;
+      }
+      const text = selector.startsWith('meta')
+        ? node.getAttribute('content') || ''
+        : node.textContent || '';
+      const matched = text.match(/\b(20\d{2}-\d{2}-\d{2})\b/);
+      if (matched) {
+        return matched[1];
+      }
+    }
+    return '';
+  }
+
+  function inferCurrentTitleFromPage() {
+    const titleSelectors = ['.video-info h4', '.mt-4 h1', 'h1', 'meta[property="og:title"]'];
+    for (const selector of titleSelectors) {
+      const node = document.querySelector(selector);
+      if (!node) {
+        continue;
+      }
+      const text = selector.startsWith('meta') ? node.getAttribute('content') || '' : node.textContent || '';
+      if (text.trim()) {
+        return text.trim();
+      }
+    }
+    return document.title || '';
+  }
+
+  function buildCurrentSeriesItem(currentCode) {
+    if (!currentCode) {
+      return null;
+    }
+    const currentUrl = normalizeVideoUrl(location.href) || buildVideoUrlForCurrentSite(currentCode);
+    if (!currentUrl) {
+      return null;
+    }
+    const currentLike = extractLikeCountFromDocument(document);
+    if (currentLike !== null) {
+      setLikeCountCache(currentUrl, currentLike);
+    }
+    setVideoExistenceCache(currentUrl, true);
+    return normalizeSeriesItem({
+      code: currentCode,
+      title: inferCurrentTitleFromPage(),
+      url: currentUrl,
+      releaseDate: inferReleaseDateFromPage(),
+      likeCount: currentLike,
+      performers: extractPerformersFromPageDocument(document)
+    });
+  }
+
+  function mergeCurrentItemIntoSeries(items, currentItem, currentCode) {
+    const sourceItems = Array.isArray(items) ? items : [];
+    const merged = sourceItems.map((item) => ({ ...item }));
+    const codeKey = String(currentCode || '').toUpperCase();
+    if (!codeKey) {
+      return merged;
+    }
+
+    let found = false;
+    for (const item of merged) {
+      if (String(item.code || '').toUpperCase() !== codeKey) {
+        continue;
+      }
+      found = true;
+      item.isCurrent = true;
+      if (currentItem) {
+        item.url = currentItem.url || item.url;
+        item.title = currentItem.title || item.title;
+        item.releaseDate = currentItem.releaseDate || item.releaseDate;
+        item.likeCount = Number.isFinite(currentItem.likeCount) ? currentItem.likeCount : item.likeCount;
+        item.performers = Array.isArray(currentItem.performers) && currentItem.performers.length > 0
+          ? currentItem.performers
+          : item.performers;
+      }
+      break;
+    }
+
+    if (!found && currentItem) {
+      merged.push({ ...currentItem, isCurrent: true });
+    }
+    return merged;
+  }
+
   function ensurePanelStyle() {
     if (document.getElementById(STYLE_ID)) {
       return;
@@ -1804,6 +1902,7 @@
         overflow: auto;
         overscroll-behavior: contain;
         -webkit-overflow-scrolling: touch;
+        padding-bottom: 8px;
       }
       #${PANEL_ID}.${PANEL_COLLAPSED_CLASS} {
         max-height: 52px;
@@ -1832,6 +1931,18 @@
         color: #7dd3fc;
         font-weight: 700;
       }
+      #${PANEL_ID} .jh-badge {
+        display: inline-block;
+        margin-left: 6px;
+        padding: 1px 6px;
+        border-radius: 999px;
+        font-size: 11px;
+        line-height: 1.4;
+        color: #052e16;
+        background: #86efac;
+        font-weight: 700;
+        vertical-align: middle;
+      }
       #${PANEL_ID} .jh-title {
         color: #cbd5e1;
         display: block;
@@ -1851,7 +1962,7 @@
           top: auto;
           right: calc(12px + env(safe-area-inset-right));
           left: calc(12px + env(safe-area-inset-left));
-          bottom: calc(12px + env(safe-area-inset-bottom));
+          bottom: calc(58px + env(safe-area-inset-bottom));
           width: auto;
           max-height: 42vh;
         }
@@ -1865,6 +1976,7 @@
         }
         #${PANEL_ID} .jh-body {
           max-height: calc(42vh - 46px);
+          padding-bottom: calc(14px + env(safe-area-inset-bottom));
         }
       }
     `;
@@ -1977,8 +2089,6 @@
       const link = document.createElement('a');
       link.className = 'jh-link';
       link.href = item.url;
-      link.target = '_blank';
-      link.rel = 'noopener noreferrer';
 
       const code = document.createElement('span');
       code.className = 'jh-code';
@@ -1989,11 +2099,20 @@
       titleNode.textContent = item.title;
 
       link.appendChild(code);
+      if (item.isCurrent) {
+        const badge = document.createElement('span');
+        badge.className = 'jh-badge';
+        badge.textContent = '当前';
+        link.appendChild(badge);
+      }
       link.appendChild(titleNode);
 
       const metaParts = [];
       if (Number.isFinite(item.likeCount)) {
         metaParts.push(`红心：${formatNumber(item.likeCount)}`);
+      }
+      if (Array.isArray(item.performers) && item.performers.length > 0) {
+        metaParts.push(`主演：${item.performers.join(' / ')}`);
       }
       if (item.releaseDate) {
         metaParts.push(`发行：${item.releaseDate}`);
@@ -2037,8 +2156,10 @@
       }
 
       const title = `相关系列作品（${seriesContext.seriesName}）`;
-      const items = await loadSeriesItems(seriesContext.seriesId, currentCode);
-      renderPanel(title, items, '系列存在，但未找到可展示条目');
+      const items = await loadSeriesItems(seriesContext.seriesId);
+      const currentItem = buildCurrentSeriesItem(currentCode);
+      const mergedItems = mergeCurrentItemIntoSeries(items, currentItem, currentCode);
+      renderPanel(title, mergedItems, '系列存在，但未找到可展示条目');
     } catch (error) {
       console.warn('[Jable Helper] 系列加载失败:', error);
       renderPanel('相关系列作品', [], '系列数据加载失败，请稍后重试');
