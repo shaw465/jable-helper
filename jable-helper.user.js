@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Jable Helper
 // @namespace    https://tampermonkey.net/
-// @version      0.9.2
+// @version      0.9.3
 // @description  多站视频页增强：系列筛选 + 红心排序 + 移动端看片手势优化
 // @author       you
 // @match        https://jable.tv/*
@@ -68,6 +68,7 @@
   const GESTURE_BRIGHTNESS_MIN = 0.3;
   const GESTURE_BRIGHTNESS_MAX = 1;
   const GESTURE_PINCH_SCALE_TRIGGER = 1.12;
+  const GESTURE_SUPPRESS_CLICK_MS = 480;
   const R18_BASE = 'https://r18.dev';
   const JABLE_LIKE_HOST_RE = /(?:^|\.)(?:jable|avple|hpjav|5av)\.tv$/i;
   const MISSAV_LIKE_HOST_RE = /(?:^|\.)missav\.(?:com|ws)$/i;
@@ -1067,7 +1068,8 @@
       hintTimer: 0,
       lastTapAt: 0,
       lastTapX: 0,
-      lastTapY: 0
+      lastTapY: 0,
+      suppressClickUntil: 0
     };
 
     const showHint = (text) => {
@@ -1182,16 +1184,16 @@
       state.moved = true;
       event.preventDefault();
 
-      if (state.activeSide === 'left') {
+      if (state.activeSide === 'right') {
         const nextVolume = state.startVolume - dy / GESTURE_VOLUME_STEP_PX;
         updateVolume(nextVolume);
-      } else if (state.activeSide === 'right') {
+      } else if (state.activeSide === 'left') {
         const nextBrightness = state.startBrightness - dy / GESTURE_BRIGHTNESS_STEP_PX;
         updateBrightness(nextBrightness);
       }
     };
 
-    const onTouchEnd = () => {
+    const onTouchEnd = (event) => {
       if (!state.activeSide && !state.moved) {
         return;
       }
@@ -1203,6 +1205,9 @@
         if (state.lastTapAt > 0 && deltaTime <= GESTURE_DOUBLE_TAP_MS && tapDistance <= GESTURE_DOUBLE_TAP_MAX_DISTANCE_PX) {
           togglePlayback();
           state.lastTapAt = 0;
+          state.suppressClickUntil = currentTime + GESTURE_SUPPRESS_CLICK_MS;
+          event.preventDefault();
+          event.stopPropagation();
         } else {
           state.lastTapAt = currentTime;
           state.lastTapX = state.startX;
@@ -1216,10 +1221,31 @@
       state.pinchTriggered = false;
     };
 
+    const onClickCapture = (event) => {
+      if (nowMs() > state.suppressClickUntil) {
+        return;
+      }
+      if (isTouchOnControl(event.target)) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+    };
+
+    const onDoubleClickCapture = (event) => {
+      if (isTouchOnControl(event.target)) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+    };
+
     container.addEventListener('touchstart', onTouchStart, { passive: true });
     container.addEventListener('touchmove', onTouchMove, { passive: false });
-    container.addEventListener('touchend', onTouchEnd, { passive: true });
-    container.addEventListener('touchcancel', onTouchEnd, { passive: true });
+    container.addEventListener('touchend', onTouchEnd, { passive: false });
+    container.addEventListener('touchcancel', onTouchEnd, { passive: false });
+    container.addEventListener('click', onClickCapture, true);
+    container.addEventListener('dblclick', onDoubleClickCapture, true);
   }
 
   function installMobileVideoGestures() {
