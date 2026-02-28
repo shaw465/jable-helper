@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Jable Helper
 // @namespace    https://tampermonkey.net/
-// @version      0.9.3
+// @version      0.9.4
 // @description  多站视频页增强：系列筛选 + 红心排序 + 移动端看片手势优化
 // @author       you
 // @match        https://jable.tv/*
@@ -315,7 +315,10 @@
       return '';
     }
     const cleaned = String(rawName).replace(/\s+/g, ' ').trim();
-    if (!cleaned || cleaned.length > 36) {
+    if (!cleaned || cleaned.length < 2 || cleaned.length > 36) {
+      return '';
+    }
+    if (/^[\d\W_]+$/u.test(cleaned)) {
       return '';
     }
     if (/^(?:n\/a|unknown|null|undefined|匿名|不明)$/i.test(cleaned)) {
@@ -373,6 +376,40 @@
       row.stars
     ];
     fields.forEach((value) => collectPerformerNames(value, bucket));
+    if (bucket.size === 0) {
+      [row.title_zh, row.title_en, row.title_ja, row.title].forEach((title) => {
+        inferPerformersFromTitle(title).forEach((name) => bucket.add(name));
+      });
+    }
+    return Array.from(bucket).slice(0, 3);
+  }
+
+  function inferPerformersFromTitle(title) {
+    if (!title) {
+      return [];
+    }
+    const text = String(title).replace(/\s+/g, ' ').trim();
+    if (!text) {
+      return [];
+    }
+
+    const stripped = text
+      .replace(/[!！?？。．…~～]+$/g, '')
+      .replace(/\s*[（(【\[].{1,16}[】\])）]\s*$/g, '')
+      .trim();
+    if (!stripped) {
+      return [];
+    }
+
+    const bucket = new Set();
+    const cjkTail = stripped.match(/([一-龥々〆ヵヶぁ-ゔァ-ヴー]{2,14})$/u);
+    if (cjkTail) {
+      collectPerformerNames(cjkTail[1], bucket);
+    }
+    const latinTail = stripped.match(/([A-Za-z][A-Za-z.'-]{1,24}(?:\s+[A-Za-z][A-Za-z.'-]{1,24}){0,2})$/);
+    if (latinTail) {
+      collectPerformerNames(latinTail[1], bucket);
+    }
     return Array.from(bucket).slice(0, 3);
   }
 
@@ -392,10 +429,15 @@
     ];
     selectors.forEach((selector) => {
       doc.querySelectorAll(selector).forEach((node) => {
-        const name = normalizePerformerName(node.textContent || '');
-        if (name) {
-          bucket.add(name);
-        }
+        const candidateTexts = [
+          node.getAttribute('title'),
+          node.getAttribute('data-original-title'),
+          node.getAttribute('aria-label'),
+          node.querySelector('.placeholder')?.getAttribute('title'),
+          node.querySelector('[data-toggle="tooltip"]')?.getAttribute('title'),
+          node.textContent || ''
+        ];
+        candidateTexts.forEach((value) => collectPerformerNames(value, bucket));
       });
     });
     return Array.from(bucket).slice(0, 3);
@@ -602,9 +644,12 @@
     const releaseDate = typeof item.releaseDate === 'string' ? item.releaseDate : '';
     const likeValue = Number(item.likeCount);
     const likeCount = Number.isFinite(likeValue) && likeValue >= 0 ? likeValue : null;
-    const performers = Array.isArray(item.performers)
+    let performers = Array.isArray(item.performers)
       ? item.performers.map((name) => normalizePerformerName(name)).filter(Boolean).slice(0, 3)
       : [];
+    if (performers.length === 0) {
+      performers = inferPerformersFromTitle(title);
+    }
     const isCurrent = item.isCurrent === true;
     return {
       code,
@@ -707,6 +752,9 @@
       const cachedLike = getLikeCountFromCache(nextItem.url);
       if (cachedLike !== null) {
         nextItem.likeCount = cachedLike;
+      }
+      if (!Array.isArray(nextItem.performers) || nextItem.performers.length === 0) {
+        nextItem.performers = inferPerformersFromTitle(nextItem.title);
       }
       return nextItem;
     });
@@ -1806,13 +1854,17 @@
       setLikeCountCache(currentUrl, currentLike);
     }
     setVideoExistenceCache(currentUrl, true);
+    const currentTitle = inferCurrentTitleFromPage();
+    const performerSet = new Set();
+    extractPerformersFromPageDocument(document).forEach((name) => performerSet.add(name));
+    inferPerformersFromTitle(currentTitle).forEach((name) => performerSet.add(name));
     return normalizeSeriesItem({
       code: currentCode,
-      title: inferCurrentTitleFromPage(),
+      title: currentTitle,
       url: currentUrl,
       releaseDate: inferReleaseDateFromPage(),
       likeCount: currentLike,
-      performers: extractPerformersFromPageDocument(document)
+      performers: Array.from(performerSet).slice(0, 3)
     });
   }
 
@@ -2137,9 +2189,10 @@
       if (Number.isFinite(item.likeCount)) {
         metaParts.push(`红心：${formatNumber(item.likeCount)}`);
       }
-      if (Array.isArray(item.performers) && item.performers.length > 0) {
-        metaParts.push(`主演：${item.performers.join(' / ')}`);
-      }
+      const performerText = Array.isArray(item.performers) && item.performers.length > 0
+        ? item.performers.join(' / ')
+        : '未知';
+      metaParts.push(`主演：${performerText}`);
       if (item.releaseDate) {
         metaParts.push(`发行：${item.releaseDate}`);
       }
