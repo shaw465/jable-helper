@@ -1,11 +1,21 @@
 // ==UserScript==
 // @name         Jable Helper
 // @namespace    https://tampermonkey.net/
-// @version      0.8.1
-// @description  jable.tv 视频页增强：自动静音 + 按真实系列展示相关作品
+// @version      0.9.0
+// @description  多站视频页增强：自动静音 + 按真实系列展示相关作品
 // @author       you
 // @match        https://jable.tv/*
 // @match        https://*.jable.tv/*
+// @match        https://avple.tv/*
+// @match        https://*.avple.tv/*
+// @match        https://hpjav.tv/*
+// @match        https://*.hpjav.tv/*
+// @match        https://5av.tv/*
+// @match        https://*.5av.tv/*
+// @match        https://missav.com/*
+// @match        https://*.missav.com/*
+// @match        https://missav.ws/*
+// @match        https://*.missav.ws/*
 // @downloadURL  https://raw.githubusercontent.com/shaw465/jable-helper/master/jable-helper.user.js
 // @updateURL    https://raw.githubusercontent.com/shaw465/jable-helper/master/jable-helper.user.js
 // @grant        none
@@ -46,6 +56,8 @@
   const VERIFY_CACHE_ONLY_MS = 20 * 60 * 1000;
   const REQUEST_TIMEOUT_MS = 12000;
   const R18_BASE = 'https://r18.dev';
+  const JABLE_LIKE_HOST_RE = /(?:^|\.)(?:jable|avple|hpjav|5av)\.tv$/i;
+  const MISSAV_LIKE_HOST_RE = /(?:^|\.)missav\.(?:com|ws)$/i;
   let isPlayPatched = false;
   const videoExistenceCache = new Map(); // url -> { exists, expireAt, checkedAt }
   const videoLikeCache = new Map(); // url -> { likeCount, expireAt, checkedAt }
@@ -157,14 +169,97 @@
     persistVerifyRuntimeState();
   }
 
+  function isJableLikeHost(hostname = location.hostname) {
+    return JABLE_LIKE_HOST_RE.test(hostname || '');
+  }
+
+  function isMissavLikeHost(hostname = location.hostname) {
+    return MISSAV_LIKE_HOST_RE.test(hostname || '');
+  }
+
+  function extractJableLikeSlug(pathname) {
+    const match = String(pathname || '').match(/^\/(?:s\d+\/)?videos\/([^/]+)\/?/i);
+    return match ? match[1].toLowerCase() : '';
+  }
+
+  function extractMissavLikeParts(pathname) {
+    const segments = String(pathname || '')
+      .split('/')
+      .map((segment) => segment.trim())
+      .filter(Boolean);
+    if (segments.length === 0) {
+      return { slug: '', prefix: '/' };
+    }
+
+    let index = 0;
+    const prefixSegments = [];
+    if (/^dm\d+$/i.test(segments[index])) {
+      prefixSegments.push(segments[index]);
+      index += 1;
+    }
+    if (index < segments.length && /^[a-z]{2}$/i.test(segments[index])) {
+      prefixSegments.push(segments[index]);
+      index += 1;
+    }
+    if (index !== segments.length - 1) {
+      return { slug: '', prefix: '/' };
+    }
+
+    const slug = segments[index].toLowerCase();
+    if (!canonicalizeCode(slug)) {
+      return { slug: '', prefix: '/' };
+    }
+
+    const prefix = prefixSegments.length > 0 ? `/${prefixSegments.join('/')}/` : '/';
+    return { slug, prefix };
+  }
+
+  function getMissavLikeDefaultPrefix() {
+    const parts = extractMissavLikeParts(location.pathname);
+    if (parts.slug && parts.prefix) {
+      return parts.prefix;
+    }
+    const locale = document.documentElement?.lang;
+    if (locale && /^[a-z]{2}$/i.test(locale)) {
+      return `/${locale.toLowerCase()}/`;
+    }
+    return '/';
+  }
+
+  function buildVideoUrlForCurrentSite(code) {
+    const slug = codeToSlug(code);
+    if (!slug) {
+      return '';
+    }
+    if (isMissavLikeHost()) {
+      const prefix = getMissavLikeDefaultPrefix();
+      return new URL(`${prefix}${slug}/`, location.origin).toString();
+    }
+    return new URL(`/videos/${slug}/`, location.origin).toString();
+  }
+
   function normalizeVideoUrl(rawUrl) {
     try {
       const url = new URL(rawUrl, location.origin);
-      const match = url.pathname.match(/^\/(?:s\d+\/)?videos\/([^/]+)\/?/i);
-      if (!match) {
+      if (isJableLikeHost(url.hostname)) {
+        const slug = extractJableLikeSlug(url.pathname);
+        if (!slug) {
+          return '';
+        }
+        return new URL(`/videos/${slug}/`, url.origin).toString();
+      }
+      if (isMissavLikeHost(url.hostname)) {
+        const { slug, prefix } = extractMissavLikeParts(url.pathname);
+        if (!slug) {
+          return '';
+        }
+        return new URL(`${prefix}${slug}/`, url.origin).toString();
+      }
+      const fallbackSlug = extractJableLikeSlug(url.pathname);
+      if (!fallbackSlug) {
         return '';
       }
-      return `https://jable.tv/videos/${match[1].toLowerCase()}/`;
+      return new URL(`/videos/${fallbackSlug}/`, url.origin).toString();
     } catch {
       return '';
     }
@@ -637,12 +732,14 @@
   }
 
   function isVideoPage() {
-    return /\/(?:s\d+\/)?videos\/[^/]+\/?/i.test(location.pathname);
+    return Boolean(getCurrentSlug());
   }
 
   function getCurrentSlug() {
-    const match = location.pathname.match(/\/(?:s\d+\/)?videos\/([^/]+)\/?/i);
-    return match ? match[1].toLowerCase() : '';
+    if (isMissavLikeHost()) {
+      return extractMissavLikeParts(location.pathname).slug;
+    }
+    return extractJableLikeSlug(location.pathname);
   }
 
   function canonicalizeCode(raw) {
@@ -667,7 +764,30 @@
       return fromSlug;
     }
 
-    const titleText = document.querySelector('.video-info h4')?.textContent || document.title;
+    const titleSelectors = [
+      '.video-info h4',
+      '.mt-4 h1',
+      'h1',
+      'meta[property="og:title"]'
+    ];
+    let titleText = '';
+    for (const selector of titleSelectors) {
+      const node = document.querySelector(selector);
+      if (!node) {
+        continue;
+      }
+      if (selector.startsWith('meta')) {
+        titleText = node.getAttribute('content') || '';
+      } else {
+        titleText = node.textContent || '';
+      }
+      if (titleText.trim()) {
+        break;
+      }
+    }
+    if (!titleText.trim()) {
+      titleText = document.title;
+    }
     const fromTitle = titleText.match(/\b([A-Z]{2,10}-\d{2,6}[A-Z]{0,5})\b/i);
     return fromTitle ? canonicalizeCode(fromTitle[1]) : '';
   }
@@ -760,7 +880,7 @@
         items.set(code, {
           code,
           title,
-          url: `https://jable.tv/videos/${codeToSlug(code)}/`,
+          url: buildVideoUrlForCurrentSite(code),
           releaseDate: row?.release_date || ''
         });
       });
@@ -774,8 +894,43 @@
     return rankedItems.filter((item) => item.code !== currentCode).slice(0, ITEM_LIMIT);
   }
 
-  function isVideoPath(pathname) {
+  function isVideoPath(pathname, hostname = location.hostname) {
+    if (isMissavLikeHost(hostname)) {
+      return Boolean(extractMissavLikeParts(pathname).slug);
+    }
+    if (isJableLikeHost(hostname)) {
+      return /^\/(?:s\d+\/)?videos\/[^/]+\/?$/i.test(pathname);
+    }
     return /^\/(?:s\d+\/)?videos\/[^/]+\/?$/i.test(pathname);
+  }
+
+  function extractLikeCountFromDocument(doc) {
+    if (!doc) {
+      return null;
+    }
+    try {
+      const selectorCandidates = [
+        'button.btn.btn-action.fav .count',
+        '.btn-action.fav .count',
+        '[class*="fav"] .count',
+        '[class*="like"] .count',
+        '.fa-heart + span',
+        '.mdi-heart + span'
+      ];
+      for (const selector of selectorCandidates) {
+        const countText = doc.querySelector(selector)?.textContent || '';
+        const parsed = parseNumberText(countText);
+        if (parsed !== null) {
+          return parsed;
+        }
+      }
+
+      const bodyText = doc.body?.textContent || '';
+      const fallbackMatch = bodyText.match(/(?:❤|♥|heart|喜欢|點讚|点赞)\D{0,12}([\d,\s]{1,12})/i);
+      return fallbackMatch ? parseNumberText(fallbackMatch[1]) : null;
+    } catch {
+      return null;
+    }
   }
 
   function extractLikeCountFromHtml(htmlText) {
@@ -784,8 +939,7 @@
     }
     try {
       const doc = new DOMParser().parseFromString(htmlText, 'text/html');
-      const countText = doc.querySelector('button.btn.btn-action.fav .count')?.textContent || '';
-      return parseNumberText(countText);
+      return extractLikeCountFromDocument(doc);
     } catch {
       return null;
     }
@@ -863,8 +1017,9 @@
 
       const finalUrl = response.url || canonicalUrl;
       const normalizedFinalUrl = normalizeVideoUrl(finalUrl);
-      const finalPath = new URL(finalUrl, location.origin).pathname;
-      const isVideoRoute = Boolean(normalizedFinalUrl) && isVideoPath(finalPath);
+      const finalUrlObject = new URL(finalUrl, location.origin);
+      const finalPath = finalUrlObject.pathname;
+      const isVideoRoute = Boolean(normalizedFinalUrl) && isVideoPath(finalPath, finalUrlObject.hostname);
       if (!isVideoRoute) {
         markVerifyFailure();
         return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
@@ -942,8 +1097,7 @@
 
   function harvestLikeCountsFromPage() {
     const currentVideoUrl = normalizeVideoUrl(location.href);
-    const currentLikeText = document.querySelector('button.btn.btn-action.fav .count')?.textContent || '';
-    const currentLike = parseNumberText(currentLikeText);
+    const currentLike = extractLikeCountFromDocument(document);
     if (currentVideoUrl) {
       setVideoExistenceCache(currentVideoUrl, true);
       if (currentLike !== null) {
@@ -966,6 +1120,38 @@
         .filter((value) => value !== null);
       if (numbers.length >= 2) {
         const likeCount = numbers[numbers.length - 1];
+        setLikeCountCache(itemUrl, likeCount);
+      }
+    });
+
+    const fallbackAnchors = document.querySelectorAll('a[href]');
+    let scanned = 0;
+    fallbackAnchors.forEach((anchor) => {
+      if (scanned >= 220) {
+        return;
+      }
+      scanned += 1;
+
+      const href = anchor.getAttribute('href') || '';
+      const itemUrl = normalizeVideoUrl(href);
+      if (!itemUrl) {
+        return;
+      }
+      setVideoExistenceCache(itemUrl, true);
+
+      const blockText =
+        anchor.closest('article,li,div,section')?.textContent ||
+        anchor.parentElement?.textContent ||
+        '';
+      if (!blockText) {
+        return;
+      }
+      const nearNumbers = blockText.match(/\d[\d,\s]{0,10}/g) || [];
+      if (nearNumbers.length === 0) {
+        return;
+      }
+      const likeCount = parseNumberText(nearNumbers[nearNumbers.length - 1]);
+      if (likeCount !== null) {
         setLikeCountCache(itemUrl, likeCount);
       }
     });
