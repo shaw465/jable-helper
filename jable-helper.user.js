@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Jable Helper
 // @namespace    https://tampermonkey.net/
-// @version      0.9.1
-// @description  多站视频页增强：系列筛选 + 红心排序 + 移动端手势控制
+// @version      0.9.2
+// @description  多站视频页增强：系列筛选 + 红心排序 + 移动端看片手势优化
 // @author       you
 // @match        https://jable.tv/*
 // @match        https://*.jable.tv/*
@@ -210,36 +210,39 @@
       .map((segment) => segment.trim())
       .filter(Boolean);
     if (segments.length === 0) {
-      return { slug: '', prefix: '/' };
+      return { slug: '', prefix: '/', locale: '', dm: '' };
     }
 
     let index = 0;
-    const prefixSegments = [];
+    let dm = '';
     if (/^dm\d+$/i.test(segments[index])) {
-      prefixSegments.push(segments[index]);
+      dm = segments[index].toLowerCase();
       index += 1;
     }
+
+    let locale = '';
     if (index < segments.length && /^[a-z]{2}$/i.test(segments[index])) {
-      prefixSegments.push(segments[index]);
+      locale = segments[index].toLowerCase();
       index += 1;
     }
+
+    const normalizedPrefix = locale ? `/${locale}/` : '/';
     if (index !== segments.length - 1) {
-      return { slug: '', prefix: '/' };
+      return { slug: '', prefix: normalizedPrefix, locale, dm };
     }
 
     const slug = segments[index].toLowerCase();
     if (!canonicalizeCode(slug)) {
-      return { slug: '', prefix: '/' };
+      return { slug: '', prefix: normalizedPrefix, locale, dm };
     }
 
-    const prefix = prefixSegments.length > 0 ? `/${prefixSegments.join('/')}/` : '/';
-    return { slug, prefix };
+    return { slug, prefix: normalizedPrefix, locale, dm };
   }
 
   function getMissavLikeDefaultPrefix() {
     const parts = extractMissavLikeParts(location.pathname);
-    if (parts.slug && parts.prefix) {
-      return parts.prefix;
+    if (parts.locale) {
+      return `/${parts.locale}/`;
     }
     const locale = document.documentElement?.lang;
     if (locale && /^[a-z]{2}$/i.test(locale)) {
@@ -304,6 +307,97 @@
       return '';
     }
     return new Intl.NumberFormat('en-US').format(value);
+  }
+
+  function normalizePerformerName(rawName) {
+    if (!rawName) {
+      return '';
+    }
+    const cleaned = String(rawName).replace(/\s+/g, ' ').trim();
+    if (!cleaned || cleaned.length > 36) {
+      return '';
+    }
+    if (/^(?:n\/a|unknown|null|undefined|匿名|不明)$/i.test(cleaned)) {
+      return '';
+    }
+    return cleaned;
+  }
+
+  function collectPerformerNames(source, bucket) {
+    if (!source) {
+      return;
+    }
+
+    if (Array.isArray(source)) {
+      source.forEach((item) => collectPerformerNames(item, bucket));
+      return;
+    }
+
+    if (typeof source === 'string') {
+      source
+        .split(/[、,\/|]|&| and /gi)
+        .map((segment) => normalizePerformerName(segment))
+        .filter(Boolean)
+        .forEach((name) => bucket.add(name));
+      return;
+    }
+
+    if (typeof source === 'object') {
+      const fields = [
+        source.name,
+        source.name_ja,
+        source.name_en,
+        source.display_name,
+        source.actress_name,
+        source.text
+      ];
+      fields.forEach((value) => collectPerformerNames(value, bucket));
+    }
+  }
+
+  function extractPerformersFromApiRow(row) {
+    if (!row || typeof row !== 'object') {
+      return [];
+    }
+    const bucket = new Set();
+    const fields = [
+      row.actress,
+      row.actresses,
+      row.actress_name,
+      row.actress_names,
+      row.actress_name_ja,
+      row.actress_name_en,
+      row.models,
+      row.performers,
+      row.stars
+    ];
+    fields.forEach((value) => collectPerformerNames(value, bucket));
+    return Array.from(bucket).slice(0, 3);
+  }
+
+  function extractPerformersFromPageDocument(doc = document) {
+    if (!doc) {
+      return [];
+    }
+    const bucket = new Set();
+    const selectors = [
+      '.video-info .models a',
+      '.video-info a[href*="/models/"]',
+      '.video-info a[href*="/star/"]',
+      '.video-info a[href*="/actress/"]',
+      '[class*="model"] a',
+      '[class*="actor"] a',
+      '[class*="performer"] a'
+    ];
+    selectors.forEach((selector) => {
+      doc.querySelectorAll(selector).forEach((node) => {
+        const name = normalizePerformerName(node.textContent || '');
+        if (name) {
+          bucket.add(name);
+        }
+      });
+    });
+    return Array.from(bucket).slice(0, 3);
   }
 
   function loadVideoExistenceCache() {
@@ -507,12 +601,16 @@
     const releaseDate = typeof item.releaseDate === 'string' ? item.releaseDate : '';
     const likeValue = Number(item.likeCount);
     const likeCount = Number.isFinite(likeValue) && likeValue >= 0 ? likeValue : null;
+    const performers = Array.isArray(item.performers)
+      ? item.performers.map((name) => normalizePerformerName(name)).filter(Boolean).slice(0, 3)
+      : [];
     return {
       code,
       title,
       url,
       releaseDate,
-      likeCount
+      likeCount,
+      performers
     };
   }
 
@@ -610,6 +708,55 @@
       return nextItem;
     });
     return hydratedItems;
+  }
+
+  function buildMissavVerifyUrlCandidates(canonicalUrl) {
+    try {
+      const url = new URL(canonicalUrl, location.origin);
+      if (!isMissavLikeHost(url.hostname)) {
+        return [url.toString()];
+      }
+
+      const target = extractMissavLikeParts(url.pathname);
+      if (!target.slug) {
+        return [url.toString()];
+      }
+
+      const current = extractMissavLikeParts(location.pathname);
+      const locale = target.locale || current.locale || '';
+      const currentDm = current.dm || '';
+      const dmFallbacks = ['dm18', 'dm21'];
+      const candidates = [];
+      const seen = new Set();
+
+      const pushPath = (path) => {
+        try {
+          const resolved = new URL(path, url.origin).toString();
+          if (seen.has(resolved)) {
+            return;
+          }
+          seen.add(resolved);
+          candidates.push(resolved);
+        } catch {}
+      };
+
+      const localeSegment = locale ? `${locale}/` : '';
+      if (currentDm) {
+        pushPath(`/${currentDm}/${localeSegment}${target.slug}/`);
+      }
+      if (locale) {
+        pushPath(`/${locale}/${target.slug}/`);
+      }
+      pushPath(`/${target.slug}/`);
+      dmFallbacks.forEach((dm) => {
+        pushPath(`/${dm}/${localeSegment}${target.slug}/`);
+      });
+      pushPath(url.pathname);
+
+      return candidates.length > 0 ? candidates : [url.toString()];
+    } catch {
+      return [canonicalUrl];
+    }
   }
 
   function setSeriesItemsCache(seriesId, items) {
@@ -1369,11 +1516,11 @@
       return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest: false };
     }
 
-    const requestWithTimeout = async (method) => {
+    const requestWithTimeout = async (targetUrl, method) => {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
       try {
-        return await fetch(canonicalUrl, {
+        return await fetch(targetUrl, {
           method,
           credentials: 'same-origin',
           redirect: 'follow',
@@ -1387,53 +1534,90 @@
 
     try {
       let usedDetailRequest = false;
-      let method = withLikeCount ? 'GET' : 'HEAD';
-      let response = await requestWithTimeout(method);
-      if (method === 'HEAD' && (response.status === 405 || response.status === 501)) {
-        method = 'GET';
-        usedDetailRequest = true;
-        response = await requestWithTimeout(method);
-      }
-      if (response.status === 429 || response.status === 403) {
-        markVerifyThrottled();
-        return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
+      const canonicalUrlObject = new URL(canonicalUrl, location.origin);
+      const isMissavTarget = isMissavLikeHost(canonicalUrlObject.hostname);
+      const requestUrls = isMissavTarget ? buildMissavVerifyUrlCandidates(canonicalUrl) : [canonicalUrl];
+      const baseMethod = withLikeCount ? 'GET' : 'HEAD';
+      let sawNotFound = false;
+      let sawForbidden = false;
+
+      for (const requestUrl of requestUrls) {
+        let method = baseMethod;
+        let response = await requestWithTimeout(requestUrl, method);
+        if (method === 'HEAD' && (response.status === 405 || response.status === 501)) {
+          method = 'GET';
+          usedDetailRequest = true;
+          response = await requestWithTimeout(requestUrl, method);
+        }
+
+        if (response.status === 429) {
+          markVerifyThrottled();
+          return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
+        }
+        if (response.status === 403) {
+          if (isMissavTarget) {
+            sawForbidden = true;
+            continue;
+          }
+          markVerifyThrottled();
+          return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
+        }
+        if (response.status === 404) {
+          if (isMissavTarget) {
+            sawNotFound = true;
+            continue;
+          }
+          setVideoExistenceCache(canonicalUrl, false);
+          markVerifySuccess();
+          return { exists: false, likeCount: null, usedDetailRequest };
+        }
+
+        const finalUrl = response.url || requestUrl;
+        const normalizedFinalUrl = normalizeVideoUrl(finalUrl);
+        const finalUrlObject = new URL(finalUrl, location.origin);
+        const finalPath = finalUrlObject.pathname;
+        const isVideoRoute = Boolean(normalizedFinalUrl) && isVideoPath(finalPath, finalUrlObject.hostname);
+        if (!isVideoRoute) {
+          if (isMissavTarget) {
+            continue;
+          }
+          markVerifyFailure();
+          return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
+        }
+
+        if (!response.ok) {
+          if (isMissavTarget) {
+            continue;
+          }
+          markVerifyFailure();
+          return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
+        }
+
+        setVideoExistenceCache(canonicalUrl, true);
+
+        let likeCount = cachedLike;
+        if (method === 'GET') {
+          usedDetailRequest = true;
+          const htmlText = await response.text();
+          const parsedLike = extractLikeCountFromHtml(htmlText);
+          if (parsedLike !== null) {
+            likeCount = parsedLike;
+            setLikeCountCache(canonicalUrl, parsedLike);
+          }
+        }
+
+        markVerifySuccess();
+        return { exists: true, likeCount, usedDetailRequest };
       }
 
-      const finalUrl = response.url || canonicalUrl;
-      const normalizedFinalUrl = normalizeVideoUrl(finalUrl);
-      const finalUrlObject = new URL(finalUrl, location.origin);
-      const finalPath = finalUrlObject.pathname;
-      const isVideoRoute = Boolean(normalizedFinalUrl) && isVideoPath(finalPath, finalUrlObject.hostname);
-      if (!isVideoRoute) {
-        markVerifyFailure();
-        return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
-      }
-
-      if (response.status === 404) {
+      if (isMissavTarget && sawNotFound && !sawForbidden) {
         setVideoExistenceCache(canonicalUrl, false);
         markVerifySuccess();
         return { exists: false, likeCount: null, usedDetailRequest };
       }
-      if (!response.ok) {
-        markVerifyFailure();
-        return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
-      }
 
-      setVideoExistenceCache(canonicalUrl, true);
-
-      let likeCount = cachedLike;
-      if (method === 'GET') {
-        usedDetailRequest = true;
-        const htmlText = await response.text();
-        const parsedLike = extractLikeCountFromHtml(htmlText);
-        if (parsedLike !== null) {
-          likeCount = parsedLike;
-          setLikeCountCache(canonicalUrl, parsedLike);
-        }
-      }
-
-      markVerifySuccess();
-      return { exists: true, likeCount, usedDetailRequest };
+      markVerifyFailure();
+      return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
     } catch {
       markVerifyFailure();
       return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest: false };
