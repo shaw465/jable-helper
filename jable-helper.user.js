@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Jable Helper
 // @namespace    https://tampermonkey.net/
-// @version      0.4.0
+// @version      0.5.0
 // @description  jable.tv 视频页增强：自动静音 + 按真实系列展示相关作品
 // @author       you
 // @match        https://jable.tv/*
@@ -19,9 +19,12 @@
   const PANEL_COLLAPSED_CLASS = 'jh-collapsed';
   const PANEL_COLLAPSED_STORAGE_KEY = 'jh-series-panel-collapsed';
   const ITEM_LIMIT = 24;
+  const CANDIDATE_LIMIT = ITEM_LIMIT * 3;
+  const VERIFY_CONCURRENCY = 4;
   const REQUEST_TIMEOUT_MS = 12000;
   const R18_BASE = 'https://r18.dev';
   let isPlayPatched = false;
+  const videoExistenceCache = new Map();
 
   function isMobileViewport() {
     return window.matchMedia('(max-width: 960px)').matches;
@@ -220,7 +223,7 @@
     let page = 1;
     let totalPages = 1;
 
-    while (page <= totalPages && items.size < ITEM_LIMIT) {
+    while (page <= totalPages && items.size < CANDIDATE_LIMIT) {
       const listUrl = `${R18_BASE}/videos/vod/movies/list2/json?id=${encodeURIComponent(seriesId)}&type=series&page=${page}`;
       const listData = await fetchJson(listUrl);
       const results = Array.isArray(listData?.results) ? listData.results : [];
@@ -248,7 +251,73 @@
       page += 1;
     }
 
-    return Array.from(items.values()).slice(0, ITEM_LIMIT);
+    const candidates = Array.from(items.values()).slice(0, CANDIDATE_LIMIT);
+    return await filterItemsExistingOnJable(candidates);
+  }
+
+  function isVideoPath(pathname) {
+    return /^\/videos\/[^/]+\/?$/i.test(pathname);
+  }
+
+  async function checkVideoExistsOnJable(url) {
+    if (videoExistenceCache.has(url)) {
+      return videoExistenceCache.get(url);
+    }
+
+    const requestWithTimeout = async (method) => {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+      try {
+        return await fetch(url, {
+          method,
+          credentials: 'same-origin',
+          redirect: 'follow',
+          signal: controller.signal,
+          cache: 'no-store'
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+    };
+
+    try {
+      let response = await requestWithTimeout('HEAD');
+      if (response.status === 405 || response.status === 501) {
+        response = await requestWithTimeout('GET');
+      }
+      const finalUrl = response.url || url;
+      const finalPath = new URL(finalUrl, location.origin).pathname;
+      const exists = response.ok && isVideoPath(finalPath);
+      videoExistenceCache.set(url, exists);
+      return exists;
+    } catch {
+      videoExistenceCache.set(url, false);
+      return false;
+    }
+  }
+
+  async function filterItemsExistingOnJable(items) {
+    if (!Array.isArray(items) || items.length === 0) {
+      return [];
+    }
+
+    const verified = [];
+    let cursor = 0;
+    const workerCount = Math.max(1, Math.min(VERIFY_CONCURRENCY, items.length));
+
+    const worker = async () => {
+      while (cursor < items.length && verified.length < ITEM_LIMIT) {
+        const currentIndex = cursor;
+        cursor += 1;
+        const item = items[currentIndex];
+        if (await checkVideoExistsOnJable(item.url)) {
+          verified.push(item);
+        }
+      }
+    };
+
+    await Promise.all(Array.from({ length: workerCount }, worker));
+    return verified.slice(0, ITEM_LIMIT);
   }
 
   function ensurePanelStyle() {
