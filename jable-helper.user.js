@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Jable Helper
 // @namespace    https://tampermonkey.net/
-// @version      0.9.4
+// @version      0.9.5
 // @description  多站视频页增强：系列筛选 + 红心排序 + 移动端看片手势优化
 // @author       you
 // @match        https://jable.tv/*
@@ -61,10 +61,12 @@
   const REQUEST_TIMEOUT_MS = 12000;
   const GESTURE_MIN_MOVE_PX = 8;
   const GESTURE_VERTICAL_RATIO = 1.2;
+  const GESTURE_HORIZONTAL_RATIO = 1.05;
   const GESTURE_DOUBLE_TAP_MS = 300;
   const GESTURE_DOUBLE_TAP_MAX_DISTANCE_PX = 24;
   const GESTURE_VOLUME_STEP_PX = 220;
   const GESTURE_BRIGHTNESS_STEP_PX = 260;
+  const GESTURE_SEEK_SECONDS_PER_PX = 0.12;
   const GESTURE_BRIGHTNESS_MIN = 0.3;
   const GESTURE_BRIGHTNESS_MAX = 1;
   const GESTURE_PINCH_SCALE_TRIGGER = 1.12;
@@ -113,6 +115,14 @@
     const minValue = Math.min(min, max);
     const maxValue = Math.max(min, max);
     return minValue + Math.floor(Math.random() * (maxValue - minValue + 1));
+  }
+
+  function logWarn(message, error) {
+    if (error) {
+      console.warn(`[Jable Helper] ${message}:`, error);
+      return;
+    }
+    console.warn(`[Jable Helper] ${message}`);
   }
 
   function isVerifyNetworkRestricted() {
@@ -853,6 +863,66 @@
     return window.matchMedia('(max-width: 960px)').matches;
   }
 
+  function detectBottomBarHeight() {
+    if (!isMobileViewport()) {
+      return 58;
+    }
+
+    const selector = [
+      'nav',
+      'footer',
+      '[class*="bottom"]',
+      '[id*="bottom"]',
+      '[class*="footer"]',
+      '[id*="footer"]',
+      '[class*="toolbar"]',
+      '[id*="toolbar"]',
+      '[class*="dock"]',
+      '[id*="dock"]'
+    ].join(',');
+
+    let detectedHeight = 58;
+    document.querySelectorAll(selector).forEach((node) => {
+      if (!(node instanceof HTMLElement)) {
+        return;
+      }
+      if (node.id === PANEL_ID || node.closest(`#${PANEL_ID}`)) {
+        return;
+      }
+
+      const style = window.getComputedStyle(node);
+      if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) {
+        return;
+      }
+      if (style.position !== 'fixed' && style.position !== 'sticky') {
+        return;
+      }
+
+      const rect = node.getBoundingClientRect();
+      if (rect.height < 24 || rect.height > 220) {
+        return;
+      }
+      if (rect.bottom < window.innerHeight - 2) {
+        return;
+      }
+      if (rect.width < window.innerWidth * 0.35) {
+        return;
+      }
+
+      detectedHeight = Math.max(detectedHeight, Math.ceil(rect.height) + 8);
+    });
+
+    return clampInteger(detectedHeight, 58, 180);
+  }
+
+  function applyPanelBottomOffset(panel) {
+    if (!(panel instanceof HTMLElement)) {
+      return;
+    }
+    const offset = detectBottomBarHeight();
+    panel.style.setProperty('--jh-panel-bottom-offset', `${offset}px`);
+  }
+
   function normalizeSortMode(mode) {
     return mode === SORT_MODE_NEWEST ? SORT_MODE_NEWEST : SORT_MODE_HOT;
   }
@@ -928,7 +998,7 @@
         position: absolute;
         inset: 0;
         pointer-events: none;
-        z-index: 3;
+        z-index: 30;
       }
       .jh-gesture-dim {
         position: absolute;
@@ -1024,6 +1094,20 @@
     return `${Math.round(clampNumber(value, 0, 1) * 100)}%`;
   }
 
+  function formatPlaybackTime(seconds) {
+    if (!Number.isFinite(seconds)) {
+      return '--:--';
+    }
+    const safeSeconds = Math.max(0, Math.floor(seconds));
+    const hours = Math.floor(safeSeconds / 3600);
+    const minutes = Math.floor((safeSeconds % 3600) / 60);
+    const remainSeconds = safeSeconds % 60;
+    if (hours > 0) {
+      return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(remainSeconds).padStart(2, '0')}`;
+    }
+    return `${String(minutes).padStart(2, '0')}:${String(remainSeconds).padStart(2, '0')}`;
+  }
+
   function lockLandscapeOrientation() {
     try {
       if (screen.orientation && typeof screen.orientation.lock === 'function') {
@@ -1082,7 +1166,8 @@
         await result.catch(() => {});
       }
       return true;
-    } catch {
+    } catch (error) {
+      logWarn('请求全屏失败', error);
       return false;
     }
   }
@@ -1110,6 +1195,9 @@
       startY: 0,
       startVolume: 0,
       startBrightness: 1,
+      startPlaybackTime: 0,
+      pendingSeekTime: null,
+      gestureMode: '',
       moved: false,
       pinchStartDistance: 0,
       pinchTriggered: false,
@@ -1177,7 +1265,7 @@
       }
 
       const touch = event.touches[0];
-      const rect = video.getBoundingClientRect();
+      const rect = container.getBoundingClientRect();
       if (touch.clientX < rect.left || touch.clientX > rect.right || touch.clientY < rect.top || touch.clientY > rect.bottom) {
         return;
       }
@@ -1187,6 +1275,9 @@
       state.activeSide = touch.clientX <= rect.left + rect.width / 2 ? 'left' : 'right';
       state.startVolume = clampNumber(video.muted ? 0 : video.volume, 0, 1);
       state.startBrightness = state.brightness;
+      state.startPlaybackTime = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+      state.pendingSeekTime = null;
+      state.gestureMode = '';
       state.moved = false;
       state.pinchStartDistance = 0;
       state.pinchTriggered = false;
@@ -1221,29 +1312,66 @@
       const absDy = Math.abs(dy);
 
       if (!state.moved) {
-        if (absDy < GESTURE_MIN_MOVE_PX) {
+        if (Math.max(absDx, absDy) < GESTURE_MIN_MOVE_PX) {
           return;
         }
-        if (absDy <= absDx * GESTURE_VERTICAL_RATIO) {
+
+        if (absDy > absDx * GESTURE_VERTICAL_RATIO) {
+          state.gestureMode = 'vertical';
+        } else if (absDx > absDy * GESTURE_HORIZONTAL_RATIO) {
+          state.gestureMode = 'horizontal';
+        } else {
           return;
         }
+
+        state.moved = true;
       }
 
-      state.moved = true;
       event.preventDefault();
 
-      if (state.activeSide === 'right') {
-        const nextVolume = state.startVolume - dy / GESTURE_VOLUME_STEP_PX;
-        updateVolume(nextVolume);
-      } else if (state.activeSide === 'left') {
-        const nextBrightness = state.startBrightness - dy / GESTURE_BRIGHTNESS_STEP_PX;
-        updateBrightness(nextBrightness);
+      if (state.gestureMode === 'vertical') {
+        if (state.activeSide === 'right') {
+          const nextVolume = state.startVolume - dy / GESTURE_VOLUME_STEP_PX;
+          updateVolume(nextVolume);
+        } else if (state.activeSide === 'left') {
+          const nextBrightness = state.startBrightness - dy / GESTURE_BRIGHTNESS_STEP_PX;
+          updateBrightness(nextBrightness);
+        }
+        return;
+      }
+
+      if (state.gestureMode === 'horizontal') {
+        const targetTime = state.startPlaybackTime + dx * GESTURE_SEEK_SECONDS_PER_PX;
+        const duration = Number(video.duration);
+        const boundedTarget = Number.isFinite(duration) && duration > 0
+          ? clampNumber(targetTime, 0, Math.max(0, duration - 0.05))
+          : Math.max(0, targetTime);
+        state.pendingSeekTime = boundedTarget;
+        const deltaSeconds = Math.round(boundedTarget - state.startPlaybackTime);
+        if (deltaSeconds > 0) {
+          showHint(`快进 ${deltaSeconds}秒 · ${formatPlaybackTime(boundedTarget)}`);
+        } else if (deltaSeconds < 0) {
+          showHint(`快退 ${Math.abs(deltaSeconds)}秒 · ${formatPlaybackTime(boundedTarget)}`);
+        } else {
+          showHint(`定位 ${formatPlaybackTime(boundedTarget)}`);
+        }
       }
     };
 
     const onTouchEnd = (event) => {
       if (!state.activeSide && !state.moved) {
         return;
+      }
+
+      if (state.moved && state.gestureMode === 'horizontal' && Number.isFinite(state.pendingSeekTime)) {
+        try {
+          video.currentTime = state.pendingSeekTime;
+          state.suppressClickUntil = nowMs() + GESTURE_SUPPRESS_CLICK_MS;
+          event.preventDefault();
+          event.stopPropagation();
+        } catch (error) {
+          logWarn('手势拖动后设置播放进度失败', error);
+        }
       }
 
       if (!state.moved && state.activeSide) {
@@ -1264,7 +1392,9 @@
       }
 
       state.activeSide = '';
+      state.gestureMode = '';
       state.moved = false;
+      state.pendingSeekTime = null;
       state.pinchStartDistance = 0;
       state.pinchTriggered = false;
     };
@@ -1695,7 +1825,8 @@
 
       markVerifyFailure();
       return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
-    } catch {
+    } catch (error) {
+      logWarn('视频存在性验证请求异常', error);
       markVerifyFailure();
       return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest: false };
     }
@@ -1771,9 +1902,9 @@
 
     const fallbackAnchors = document.querySelectorAll('a[href]');
     let scanned = 0;
-    fallbackAnchors.forEach((anchor) => {
+    for (const anchor of fallbackAnchors) {
       if (scanned >= 220) {
-        return;
+        break;
       }
       scanned += 1;
 
@@ -1799,7 +1930,7 @@
       if (likeCount !== null) {
         setLikeCountCache(itemUrl, likeCount);
       }
-    });
+    }
   }
 
   function inferReleaseDateFromPage() {
@@ -1914,7 +2045,7 @@
         right: 16px;
         width: 340px;
         max-height: 76vh;
-        z-index: 99999;
+        z-index: 980;
         background: rgba(12, 18, 28, 0.95);
         color: #e5e7eb;
         border: 1px solid rgba(148, 163, 184, 0.35);
@@ -1954,7 +2085,9 @@
       #${PANEL_ID} .jh-sort-btn {
         border: none;
         border-radius: 6px;
-        padding: 2px 8px;
+        min-width: 44px;
+        min-height: 34px;
+        padding: 6px 10px;
         font-size: 12px;
         line-height: 1.4;
         color: #cbd5e1;
@@ -1969,11 +2102,19 @@
         display: none;
         border: 1px solid rgba(148, 163, 184, 0.45);
         border-radius: 8px;
-        padding: 2px 8px;
+        min-width: 44px;
+        min-height: 34px;
+        padding: 6px 10px;
         font-size: 12px;
         line-height: 1.4;
         color: #e5e7eb;
         background: rgba(30, 41, 59, 0.55);
+      }
+      #${PANEL_ID} .jh-sort-btn:focus-visible,
+      #${PANEL_ID} .jh-toggle:focus-visible,
+      #${PANEL_ID} .jh-link:focus-visible {
+        outline: 2px solid #7dd3fc;
+        outline-offset: 2px;
       }
       #${PANEL_ID} .jh-body {
         max-height: calc(76vh - 46px);
@@ -2040,7 +2181,7 @@
           top: auto;
           right: calc(12px + env(safe-area-inset-right));
           left: calc(12px + env(safe-area-inset-left));
-          bottom: calc(58px + env(safe-area-inset-bottom));
+          bottom: calc(var(--jh-panel-bottom-offset, 58px) + env(safe-area-inset-bottom));
           width: auto;
           max-height: 42vh;
         }
@@ -2050,7 +2191,8 @@
           justify-content: center;
         }
         #${PANEL_ID} .jh-sort-btn {
-          padding: 2px 7px;
+          min-height: 36px;
+          padding: 6px 9px;
         }
         #${PANEL_ID} .jh-body {
           max-height: calc(42vh - 46px);
@@ -2068,17 +2210,17 @@
       panel.id = PANEL_ID;
       panel.innerHTML = `
         <div class="jh-header">
-          <span id="jh-series-title">${title}</span>
+          <span id="jh-series-title" role="heading" aria-level="2">${title}</span>
           <div class="jh-actions">
             <div class="jh-sort" role="group" aria-label="排序方式">
               <button type="button" class="jh-sort-btn" data-sort-mode="${SORT_MODE_HOT}" aria-pressed="true">最热</button>
               <button type="button" class="jh-sort-btn" data-sort-mode="${SORT_MODE_NEWEST}" aria-pressed="false">最新</button>
             </div>
-            <span class="jh-sub" id="jh-series-count">加载中...</span>
-            <button type="button" class="jh-toggle" id="${TOGGLE_ID}" aria-expanded="true">收起</button>
+            <span class="jh-sub" id="jh-series-count" aria-live="polite">加载中...</span>
+            <button type="button" class="jh-toggle" id="${TOGGLE_ID}" aria-expanded="true" aria-controls="jh-series-body">收起</button>
           </div>
         </div>
-        <div class="jh-body" id="jh-series-body"></div>
+        <div class="jh-body" id="jh-series-body" role="region" aria-labelledby="jh-series-title"></div>
       `;
       document.body.appendChild(panel);
     }
@@ -2112,6 +2254,7 @@
     const shouldCollapse = isMobileViewport() && readCollapsedPreference();
     applyCollapsedState(panel, shouldCollapse);
     applySortModeState(panel, readSortModePreference());
+    applyPanelBottomOffset(panel);
 
     if (panel.dataset.responsiveBound !== '1') {
       panel.dataset.responsiveBound = '1';
@@ -2119,12 +2262,22 @@
       const syncPanelMode = () => {
         const nextCollapsed = mediaQuery.matches ? readCollapsedPreference() : false;
         applyCollapsedState(panel, nextCollapsed);
+        applyPanelBottomOffset(panel);
       };
       if (typeof mediaQuery.addEventListener === 'function') {
         mediaQuery.addEventListener('change', syncPanelMode);
       } else if (typeof mediaQuery.addListener === 'function') {
         mediaQuery.addListener(syncPanelMode);
       }
+    }
+
+    if (panel.dataset.offsetBound !== '1') {
+      panel.dataset.offsetBound = '1';
+      const refreshOffset = () => applyPanelBottomOffset(panel);
+      window.addEventListener('resize', refreshOffset, { passive: true });
+      window.setTimeout(refreshOffset, 800);
+      window.setTimeout(refreshOffset, 1800);
+      window.setTimeout(refreshOffset, 3200);
     }
 
     return panel;
