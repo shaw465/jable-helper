@@ -36,7 +36,7 @@
   const GESTURE_STYLE_ID = 'jh-player-gesture-style';
   const VIDEO_EXISTENCE_CACHE_KEY = 'jh-video-existence-cache-v1';
   const VIDEO_LIKE_CACHE_KEY = 'jh-video-like-cache-v1';
-  const SERIES_ITEMS_CACHE_KEY = 'jh-series-items-cache-v1';
+  const SERIES_ITEMS_CACHE_KEY = 'jh-series-items-cache-v2';
   const VERIFY_RUNTIME_STATE_KEY = 'jh-verify-runtime-state-v1';
   const VIDEO_EXISTENCE_CACHE_MAX = 1200;
   const VIDEO_LIKE_CACHE_MAX = 1600;
@@ -1673,6 +1673,18 @@
     }
   }
 
+  function extractPerformersFromHtml(htmlText) {
+    if (!htmlText) {
+      return [];
+    }
+    try {
+      const doc = new DOMParser().parseFromString(htmlText, 'text/html');
+      return extractPerformersFromPageDocument(doc);
+    } catch {
+      return [];
+    }
+  }
+
   function sortSeriesItems(items, mode = SORT_MODE_HOT) {
     const normalizedMode = normalizeSortMode(mode);
     return items
@@ -1705,22 +1717,27 @@
   async function checkVideoMetaOnJable(url, options = {}) {
     const canonicalUrl = normalizeVideoUrl(url);
     if (!canonicalUrl) {
-      return { exists: false, likeCount: null, usedDetailRequest: false };
+      return { exists: false, likeCount: null, usedDetailRequest: false, performers: [] };
     }
 
     const withLikeCount = Boolean(options.withLikeCount);
+    const withPerformers = Boolean(options.withPerformers);
+    const withDetailMeta = withLikeCount || withPerformers;
     const cachedExists = getVideoExistenceFromCache(canonicalUrl);
     const cachedLike = getLikeCountFromCache(canonicalUrl);
     if (cachedExists === false) {
-      return { exists: false, likeCount: cachedLike, usedDetailRequest: false };
+      return { exists: false, likeCount: cachedLike, usedDetailRequest: false, performers: [] };
     }
-    if (cachedExists === true && (!withLikeCount || cachedLike !== null)) {
-      return { exists: true, likeCount: cachedLike, usedDetailRequest: false };
+    if (cachedExists === true && !withDetailMeta) {
+      return { exists: true, likeCount: cachedLike, usedDetailRequest: false, performers: [] };
+    }
+    if (cachedExists === true && withLikeCount && cachedLike !== null && !withPerformers) {
+      return { exists: true, likeCount: cachedLike, usedDetailRequest: false, performers: [] };
     }
 
     const canVerify = await reserveVerifyRequestSlot();
     if (!canVerify) {
-      return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest: false };
+      return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest: false, performers: [] };
     }
 
     const requestWithTimeout = async (targetUrl, method) => {
@@ -1744,7 +1761,7 @@
       const canonicalUrlObject = new URL(canonicalUrl, location.origin);
       const isMissavTarget = isMissavLikeHost(canonicalUrlObject.hostname);
       const requestUrls = isMissavTarget ? buildMissavVerifyUrlCandidates(canonicalUrl) : [canonicalUrl];
-      const baseMethod = withLikeCount ? 'GET' : 'HEAD';
+      const baseMethod = withDetailMeta ? 'GET' : 'HEAD';
       let sawNotFound = false;
       let sawForbidden = false;
 
@@ -1759,7 +1776,7 @@
 
         if (response.status === 429) {
           markVerifyThrottled();
-          return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
+          return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest, performers: [] };
         }
         if (response.status === 403) {
           if (isMissavTarget) {
@@ -1767,7 +1784,7 @@
             continue;
           }
           markVerifyThrottled();
-          return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
+          return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest, performers: [] };
         }
         if (response.status === 404) {
           if (isMissavTarget) {
@@ -1776,7 +1793,7 @@
           }
           setVideoExistenceCache(canonicalUrl, false);
           markVerifySuccess();
-          return { exists: false, likeCount: null, usedDetailRequest };
+          return { exists: false, likeCount: null, usedDetailRequest, performers: [] };
         }
 
         const finalUrl = response.url || requestUrl;
@@ -1789,7 +1806,7 @@
             continue;
           }
           markVerifyFailure();
-          return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
+          return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest, performers: [] };
         }
 
         if (!response.ok) {
@@ -1797,38 +1814,44 @@
             continue;
           }
           markVerifyFailure();
-          return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
+          return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest, performers: [] };
         }
 
         setVideoExistenceCache(canonicalUrl, true);
 
         let likeCount = cachedLike;
+        let performers = [];
         if (method === 'GET') {
           usedDetailRequest = true;
           const htmlText = await response.text();
-          const parsedLike = extractLikeCountFromHtml(htmlText);
-          if (parsedLike !== null) {
-            likeCount = parsedLike;
-            setLikeCountCache(canonicalUrl, parsedLike);
+          if (withLikeCount) {
+            const parsedLike = extractLikeCountFromHtml(htmlText);
+            if (parsedLike !== null) {
+              likeCount = parsedLike;
+              setLikeCountCache(canonicalUrl, parsedLike);
+            }
+          }
+          if (withPerformers) {
+            performers = extractPerformersFromHtml(htmlText);
           }
         }
 
         markVerifySuccess();
-        return { exists: true, likeCount, usedDetailRequest };
+        return { exists: true, likeCount, usedDetailRequest, performers };
       }
 
       if (isMissavTarget && sawNotFound && !sawForbidden) {
         setVideoExistenceCache(canonicalUrl, false);
         markVerifySuccess();
-        return { exists: false, likeCount: null, usedDetailRequest };
+        return { exists: false, likeCount: null, usedDetailRequest, performers: [] };
       }
 
       markVerifyFailure();
-      return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest };
+      return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest, performers: [] };
     } catch (error) {
       logWarn('视频存在性验证请求异常', error);
       markVerifyFailure();
-      return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest: false };
+      return { exists: cachedExists === true, likeCount: cachedLike, usedDetailRequest: false, performers: [] };
     }
   }
 
@@ -1855,8 +1878,13 @@
         item.likeCount = cachedLike;
       }
 
+      const hasPerformers = Array.isArray(item.performers) && item.performers.length > 0;
       const shouldProbeLike = item.likeCount == null && detailRequestsUsed < MAX_DETAIL_REQUESTS_PER_PAGE;
-      const meta = await checkVideoMetaOnJable(item.url, { withLikeCount: shouldProbeLike });
+      const shouldProbePerformers = !hasPerformers && detailRequestsUsed < MAX_DETAIL_REQUESTS_PER_PAGE;
+      const meta = await checkVideoMetaOnJable(item.url, {
+        withLikeCount: shouldProbeLike,
+        withPerformers: shouldProbePerformers
+      });
       if (meta.usedDetailRequest) {
         detailRequestsUsed += 1;
       }
@@ -1865,6 +1893,9 @@
       }
       if (meta.likeCount !== null) {
         item.likeCount = meta.likeCount;
+      }
+      if (Array.isArray(meta.performers) && meta.performers.length > 0) {
+        item.performers = meta.performers;
       }
       verified.push(item);
     }
